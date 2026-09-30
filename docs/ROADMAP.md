@@ -1,0 +1,442 @@
+# Roadmap
+
+Порядок важен: каждый шаг опирается на то, что уже существует, и ничего
+здесь не стоит делать раньше, чем в этом появится реальная необходимость.
+Redis (шаг 6) и Kubernetes (шаг 11) — то, что специально отложено: без
+Redis, пока нет медленного вызова, который нужно кэшировать, без
+Kubernetes — пока нет ни кластера, ни цели деплоя. Всё остальное ниже
+сделано, включая пункт 16 (auth/2FA/OAuth, удаление аккаунта, участники
+семьи, импорт, bulk-импорт, загрузка изображений) — то, что аудит
+2026-09-30 нашёл неперенесённым; перенесено тем же днём.
+
+## 1. Go backend — основные домены готовы
+
+`Next.js -> Go API -> PostgreSQL` вместо того, чтобы всё делал Next.js.
+Вертикальные срезы под `internal/` (`auth`, `users`, `families`, `series`,
+`polls`, `events`, `activitylog`, `movies`), а не технические слои.
+
+Перенесено и проверено (юнит- и интеграционными тестами против реального
+Postgres, плюс сквозной smoke-test через реальный HTTP): `users`,
+`families`, сериалы семьи (`series`: CRUD + статус просмотра + прогресс по
+эпизодам + комментарии + реакции), опросы "что смотрим сегодня" (`polls`:
+создание, голосование, закрытие — с честным соблюдением всех RLS-правил
+про закрытые опросы и чужие опции), запланированные просмотры (`events`:
+создание + RSVP), журнал активности семьи (`activitylog`), получение
+метаданных фильма по внешнему ID (`movies`, через уже готовый
+`movieprovider`). Каждое доменное действие, которое имеет смысл как
+событие, публикует его через outbox (`movie.added`, `movie.watched`,
+`movie.rated`, `poll.created`, `poll.closed`, `watch_event.created`).
+
+`notifications` (реальная доставка push) и аналитика
+(`stats`/`achievements`/`wrapped`/`recommendations`) тоже перенесены —
+подробности в пункте 12 ниже. `watch history`, `episode calendar`,
+`inactivity nudges` и `export data` тоже перенесены — пункт 14.
+`season tracking`, dead-letter стрим, удаление мёртвых push-подписок и
+rate-limit на movies-прокси — пункт 15.
+
+Аудит notrecinema-app (2026-09-30) нашёл заметный объём бэкенд-логики,
+которая на тот момент ещё не была перенесена — auth/2FA/OAuth, удаление
+аккаунта, управление участниками семьи, импорт, bulk-импорт, загрузка
+изображений. Всё это перенесено тем же днём — пункт 16.
+
+Осталось сознательно отложенное: Redis (пункт 6) и email-доставка
+напоминаний в `internal/nudges` и `internal/seasons` (в Go-сервисах нет
+SMTP-инфраструктуры, есть только push).
+
+В процессе нашлись и были исправлены два реальных бага:
+- pgx не мог согласовать тип параметра `$3`, использованного и как
+  значение колонки, и в сравнении `$3 = 'watched'` в одном запросе
+  (`SQLSTATE 42P08`) — решение считалось в Go до построения SQL, а не
+  сравнением параметра со строковым литералом внутри запроса.
+- внутренние (5xx) ошибки нигде не логировались на сервере — клиент
+  видит только generic "internal server error" (осознанно, чтобы не
+  утекала причина), но без серверного лога настоящая причина была бы
+  вообще нигде не видна. `response.Error` теперь логирует их.
+
+## 2. Схема БД остаётся единственным источником истины — готово
+
+Схема (`migrations/`, `grants.sql`, `init.sh`) вынесена в отдельный пакет
+[`../notrecinema-schema`](../../notrecinema-schema), которым пользуются и
+`notrecinema-app`, и `notrecinema-api`, и `notrecinema-worker` — ни один
+сервис больше не лезет в дерево другого за схемой. `docker-compose.yml`
+здесь и в `notrecinema-app` собирают сервис `migrate` из
+`../notrecinema-schema`.
+
+## 3. Outbox pattern — готово
+
+`internal/outbox`: `Insert` кладёт событие в `outbox_events` внутри той же
+транзакции, что и основная запись (см. `internal/families.Create` —
+семья, участник-владелец и событие `family.member.joined` коммитятся или
+откатываются вместе). Отдельный `Poller` (запущен горутиной в
+`cmd/api/main.go`) каждые 2 секунды вычитывает неопубликованные строки
+(`FOR UPDATE SKIP LOCKED` — безопасно при нескольких репликах API) и
+публикует их в NATS. Проверено end-to-end через `docker compose up`:
+создание семьи → строка в `outbox_events` → сообщение в NATS → обработка в
+`notrecinema-worker`.
+
+## 4. NATS (JetStream) вместо Kafka — готово
+
+`internal/eventbus`: один стрим `NOTRECINEMA` на весь домен, subject'ы вида
+`notrecinema.family.member.joined`. Легче, чем Kafka, для того, что
+реально нужно: pub/sub, durable delivery, ретраи. Реализовано:
+`family.member.joined`, `movie.added`, `movie.watched`, `movie.rated`,
+`poll.created`, `poll.closed`, `watch_event.created` — каждое из них
+воркер превращает в push-уведомление напрямую (см. пункт 12), отдельный
+`notification.created` не понадобился.
+
+## 5. Отдельный Go-воркер — готово
+
+[`../notrecinema-worker`](../../notrecinema-worker), потребляет subject'ы
+NATS, которые публикует outbox. Ретраи с экспоненциальным backoff
+(JetStream `BackOff` на консьюмере), идемпотентность
+(`worker_processed_events`, PK-конфликт = уже обработано), dead letter
+через `MaxDeliver` (застрявшие сообщения видны через `consumer info` на
+NATS-мониторинге `:8222` — отдельного dead-letter subject'а пока нет,
+заведём, когда таких сообщений на практике станет много). Обработчики на
+все 7 типов событий делают реальное дело — см. пункт 12 (notifications).
+
+## 6. Redis — только когда появится конкретный медленный вызов
+
+Пока не делаем. Кандидат — запрос метаданных фильма во внешнем API
+(TMDB/Kinopoisk/OMDB, уже вызываются из `notrecinema-app` и теперь из
+`internal/movieprovider` здесь): cache-aside с TTL, инвалидация при
+обновлении, distributed lock на случай гонки за один и тот же ключ.
+
+## 7. Абстракция `MovieProvider` с реальной отказоустойчивостью — готово
+
+`internal/movieprovider`: интерфейс `Provider` (`GetMovie(ctx, externalID)`)
++ три реализации (`TMDB`, `OMDB`, `Kinopoisk`), плюс `Resilient` (таймаут на
+попытку, ретраи с экспоненциальным backoff и джиттером, circuit breaker —
+`sony/gobreaker`) и `Fallback` (цепочка провайдеров, первый успешный
+результат побеждает). Резистентность проверена тестами с намеренно
+нестабильным `chaosProvider` (ретраи до успеха, обрыв по таймауту,
+открытие breaker'а после серии отказов), а не только на happy path.
+Пока не подключено к HTTP-роуту — это часть переноса домена `movies` из
+шага 1.
+
+## 8. Observability — готово
+
+`internal/telemetry` в обоих сервисах:
+
+- **Метрики** (Prometheus, `/metrics`): `http_requests_total` +
+  `http_request_duration_seconds` (API), `outbox_published_total` /
+  `outbox_failed_total` / `outbox_pending` (outbox-поллер),
+  `external_api_requests_total` / `external_api_duration_seconds`
+  (`movieprovider.Resilient`, по провайдеру), `worker_jobs_total` /
+  `worker_job_duration_seconds` (воркер, по типу события и исходу:
+  success/failure/duplicate/no_handler). `redis_hit_ratio` появится вместе
+  с Redis (шаг 6).
+- **Логи**: структурированный JSON через `log/slog` в обоих сервисах.
+- **Трейсы**: OpenTelemetry → OTLP/HTTP → Jaeger (в `docker-compose.yml`).
+  `eventbus.Publish` прокидывает `traceparent` в заголовки NATS-сообщения,
+  `consumer.handleMessage` его извлекает и продолжает тот же trace —
+  проверено вживую: `outbox.publish` (api) и `worker.process` (worker)
+  реально оказываются в одном trace ID в Jaeger, не в двух несвязанных.
+
+В процессе нашёлся и был исправлен реальный баг: `r.Pattern`
+(путь для лейбла метрики) не переживал `r.WithContext()` внутри
+`auth.Middleware`, из-за чего все защищённые роуты в `http_requests_total`
+попадали под один и тот же label `path="/"`. Метрика-миддлварь теперь
+оборачивает `protectedMux` напрямую, а не всю цепочку снаружи.
+
+## 9. CI/CD — готово
+
+`.gitlab-ci.yml` есть у `notrecinema-api`, `notrecinema-worker` и
+`notrecinema-schema`. Для Go-сервисов: `go vet` + `golangci-lint`
+(проверено локально на реальном коде — линтер нашёл и мы исправили 6
+настоящих находок errcheck), `go test ./...` с JUnit-отчётом,
+`go test -tags integration ./...` против эфемерных Postgres + NATS
+(схема клонируется из `notrecinema-schema` по `$SCHEMA_REPO_URL` — задать
+в CI/CD-переменных проекта, когда появится реальный GitLab-репозиторий),
+Trivy-сканы (filesystem + image), сборка через Kaniko, ручной деплой по
+SSH. У `notrecinema-schema` — отдельная простая проверка: применить все
+миграции к чистой базе дважды подряд (второй прогон должен быть no-op —
+проверка идемпотентности), реально прогнано локально в контейнере.
+DAST сознательно не заведён: без реального UI и с auth, которую ZAP не
+пройдёт без cookie сессии, польза от сканирования `/healthz` минимальна.
+
+Ни один из трёх `.gitlab-ci.yml` не запускался на настоящем GitLab-раннере
+(нет ещё реальных GitLab-репозиториев) — синтаксис проверен парсингом
+YAML, а job'ы, которые можно было прогнать локально (docker-based шаги),
+реально прогнаны.
+
+## 10. Контейнеризация — готово (расширяется по мере надобности)
+
+`docker-compose.yml` в этом репозитории сейчас поднимает всю
+backend-платформу разом: `postgres`, `migrate` (из `notrecinema-schema`),
+`nats`, `api`, `worker` (собирается из `../notrecinema-worker`). Дальше
+расширяется так же, добавлением сервиса, когда он появляется (Redis и
+т.д.) — `docker compose up` должен продолжать поднимать весь стек одной
+командой.
+
+## 11. Kubernetes — сознательно не делаем
+
+Не нужен, пока нет ни реального кластера, ни цели деплоя — заводить
+манифесты просто про запас смысла нет. Вернуться к этому пункту, когда
+появится конкретная причина (реальный registry, реальный кластер).
+
+## 12. Notifications — реальная доставка (web push) — готово
+
+Раньше `notrecinema-worker` только логировал `family.member.joined`.
+Теперь `internal/webpush` (worker) отправляет настоящие push-уведомления
+через VAPID + aes128gcm (RFC8291,
+`github.com/SherClockHolmes/webpush-go` — тот же протокол, что npm-пакет
+`web-push` в notrecinema-app), `internal/notifications` (worker) вычитывает
+подписки участников семьи через `get_family_push_subscriptions_system`
+(SECURITY DEFINER, миграция 0010 + новая перегрузка с `exclude_user_id` в
+0028 — у воркера нет `app.current_user_id`, поэтому обычные RLS-функции
+не подходят) и рассылает всем, кроме автора события. Обработчики есть на
+все 7 типов событий: `family.member.joined`, `movie.added/watched/rated`,
+`poll.created/closed`, `watch_event.created`.
+
+По пути обнаружился и был закрыт реальный пробел: `family.member.joined`
+раньше происходил только при создании семьи (владелец сам себе), потому
+что в Go API не было эндпоинта присоединения по инвайт-коду — добавлен
+`POST /api/v1/families/join` (`internal/families.Join`,
+`find_family_by_invite_code`, та же SECURITY DEFINER функция, что
+использует notrecinema-app). Также добавлены `POST`/`DELETE
+/api/v1/notifications/subscriptions` (API) — управление подписками,
+сама отправка (внешние HTTP-запросы к push-сервису браузера) остаётся
+только в воркере.
+
+Проверено по-настоящему, не моком: юнит-тесты в `internal/webpush` гоняют
+реальный VAPID JWT + шифрование aes128gcm через httptest (настоящая пара
+ключей P-256, как в браузере). Интеграционный тест
+(`internal/notifications`) подтверждает, что `get_family_push_subscriptions_system`
+с `exclude_user_id` реально исключает автора и реально находит остальных
+участников. Сквозной smoke-test (два пользователя, join по инвайт-коду,
+подписка, `POST /series`) реально доставил зашифрованный push
+(`Content-Encoding: aes128gcm`, `Authorization` с VAPID JWT, 4096 байт
+тела) стороннему HTTP-серверу через Docker-сеть.
+
+## 13. Stats / achievements / wrapped / recommendations — готово
+
+`internal/stats`: прямой перенос SQL-логики из notrecinema-app
+(`src/shared/api/postgres/queries.ts`) — сами формулы уже отработаны в
+проде, перепроверять их заново смысла не было, перепроверялась только
+корректность переноса. `GetFamilyStats` (часы просмотра, топ-жанры,
+разбивка по месяцам), `GetFamilyAchievements` (9 достижений + расчёт
+текущего стрика по неделям, `computeCurrentStreakWeeks` перенесена
+дословно), `GetYearWrapped` (итоги конкретного года), `GetRecommendations`
+(ранжирование непросмотренных сериалов по жанрам, которые семья оценила
+на 4-5).
+
+Проверено реальными числами через интеграционные тесты: 10 эпизодов ×
+60 минут действительно дают `totalHoursWatched: 10`, `wrapped` для 2024
+и 2026 годов реально видит только просмотры своего года, рекомендации
+реально ранжируют выше сериал того жанра, который семья уже любит, и не
+включают уже просмотренное. Плюс сквозная проверка через реальный HTTP
+в `docker compose` стенде.
+
+## 14. Watch history / episode calendar / inactivity nudges / export — готово
+
+Последние четыре домена, которых не было ни в первоначальном переносе, ни
+в notrecinema-app как отдельных Go-пакетов — все схемы для них уже
+существовали в `notrecinema-schema` (написаны заранее для монолита), здесь
+перенесена только Go-логика поверх них.
+
+- **`internal/history`** — журнал просмотров семьи, прямой перенос
+  `getWatchHistory`: агрегат `family_series_status` (`status = 'watched'`)
+  без отдельной таблицы, N+1 пагинация (запросили `pageSize+1`, чтобы узнать
+  `hasMore` без отдельного `COUNT`). Семейная видимость — не только своя —
+  обеспечена RLS-политикой из миграции 0008.
+- **`internal/export`** — выгрузка собственных данных (`profile`, `family`,
+  `series`) в JSON или CSV, per-user, не per-family. Прямой перенос
+  `GET /api/export/data`, включая ровно ту же CSV-эскейпинг-логику.
+- **`internal/calendar`** — дата следующего эпизода (TMDB `/find` +
+  `/tv/{id}`) для сериалов, импортированных из OMDb/IMDb-CSV.
+  `GET .../calendar` отдаёт `{upcoming, checkable}` (то же деление, что
+  раньше делал клиент); `POST .../next-episode/check` — разовая проверка
+  по требованию, с троттлингом через `check_rate_limit` (20/10 мин на
+  пользователя, миграция 0016); фоновый `RunPeriodicRefresh` (раз в 12
+  часов) — Go-эквивалент cron `check-next-episode`, массово обновляет все
+  привязанные сериалы через `get_series_for_episode_check` с concurrency 5.
+- **`internal/nudges`** — "давно не продолжали" напоминания. Вместо
+  HTTP-cron роута, который нужно дёргать снаружи по расписанию
+  (как в notrecinema-app), — тикер внутри процесса API (по умолчанию раз в
+  сутки, `NUDGE_CHECK_INTERVAL`/`NUDGE_DAYS_THRESHOLD`), тот же выбор, что
+  уже сделан для `outbox.Poller`. Находит застрявший прогресс через
+  `get_stale_progress`, атомарно застолбляет каждую строку
+  (`mark_progress_reminded`, миграция 0020 — RETURNING-based claim, чтобы
+  пересекающиеся прогоны не задваивали напоминание) и публикует
+  `progress.stale` в outbox только для реально застолбленных строк.
+  `notrecinema-worker` слушает это событие (`handlers.ProgressStale`) и
+  шлёт push одному пользователю через новый `Notifier.NotifyUser`
+  (`get_user_push_subscriptions_system`, миграция 0011) — в отличие от
+  `NotifyFamily`, адресован не всей семье. Email-часть оригинала
+  сознательно не перенесена: в Go-сервисах нет SMTP-инфраструктуры.
+
+Проверено реальными интеграционными тестами против настоящего Postgres, не
+только отсутствием ошибки: участник семьи видит чужую "watched"-отметку
+(история), выгрузка содержит правильный рейтинг/прогресс и в JSON, и в
+CSV, сериал с прогрессом, искусственно состаренным на 20 дней, получает
+ровно одно `progress.stale`-событие, а повторный прогон в тот же день его
+не дублирует; свежий (2 дня) прогресс событие не получает вообще; RLS
+реально прячет чужой сериал от `CheckNextEpisode` (404), а сериал без
+привязки к внешнему каталогу реально отклоняется (400). Плюс сквозная
+проверка через реальный HTTP в `docker compose` стенде: created→watched→
+history→export (JSON и CSV) на живых данных.
+
+## 15. Season tracking, dead-letter стрим, удаление мёртвых подписок, rate-limit на movies — готово
+
+Четыре независимых улучшения поверх уже готового.
+
+- **Season tracking** (`internal/seasons`, notrecinema-api) — перенос
+  `check-new-seasons` cron и `checkSeriesUpdatesAction` из notrecinema-app:
+  отслеживает `total_seasons` для сериалов, импортированных из
+  Kinopoisk/OMDb (миграция 0010), и уведомляет семью при его увеличении.
+  Два источника: Kinopoisk через `api.kinopoisk.dev/v1.4` (НЕ тот же API,
+  что уже используется в `internal/movieprovider` для метаданных фильма —
+  это отдельный, более новый эндпоинт с полем `seasonsInfo`, у старого
+  `kinopoiskapiunofficial.tech` такой разбивки нет); OMDb — через `totalSeasons`
+  в ответе (у OMDb нет разбивки по эпизодам, `total_episodes` для него
+  всегда остаётся как было). Два входа, как и в оригинале: разовая проверка
+  по требованию (`POST .../season-updates/check`, делит rate-limit-бакет
+  `season-check:user:` с `internal/calendar`) и фоновый `RunPeriodicRefresh`
+  (раз в 12 часов, concurrency 5). Уведомление идёт через outbox
+  (`season.updated`) → `notrecinema-worker`, а не напрямую — в отличие от
+  notrecinema-app, где cron- и action-путь делали это по-разному (`_system`
+  SQL-функции vs RLS-функции с `excludeUserId`). Для этого
+  `notifications.Notifier.NotifyFamily` (воркер) стал обёрткой над новым
+  `NotifyFamilyExcept`, который умеет передать `exclude_user_id = NULL`
+  (миграция 0028) для cron-обновления (уведомляем всех) и конкретный ID для
+  разовой проверки (не уведомляем того, кто её запустил).
+- **Dead-letter стрим** (`notrecinema-worker/internal/eventbus` +
+  `internal/consumer`) — раньше сообщения, исчерпавшие `MaxDeliver`, были
+  видны только через `consumer info`. Теперь отдельный стрим
+  `NOTRECINEMA_DEADLETTER` (subject'ы `dead-letter.<type>`, не
+  `notrecinema.dead-letter.*` — иначе основной консьюмер, слушающий
+  `notrecinema.>`, подобрал бы их как новое событие). На последней попытке
+  (`msg.Metadata().NumDelivered >= MaxDeliver`) `handleMessage` публикует
+  исходный envelope туда и завершает сообщение через `Term`.
+- **Удаление мёртвых push-подписок** — раньше 404/410 от push-сервиса
+  только логировался, строка в `push_subscriptions` копилась до следующей
+  попытки подписаться (как и в notrecinema-app). Теперь
+  `delete_push_subscription_system` (SECURITY DEFINER, миграция 0029,
+  скоупится по `endpoint` — это всё, что известно в точке отказа) удаляет
+  её сразу.
+- **Rate-limit на `GET /api/v1/movies/...`** — единственный внешний прокси,
+  который раньше ничем не был защищён от одного пользователя, выжигающего
+  общую квоту TMDB/OMDb/Kinopoisk. `check_rate_limit` (миграция 0016) — та
+  же функция, что уже использует `internal/calendar` — 60 запросов/10 минут
+  на пользователя.
+
+Проверено реальными интеграционными тестами против настоящего Postgres:
+RLS прячет чужой сериал от `CheckSeriesUpdates` (404), непривязанный
+сериал отклоняется (400) — `internal/seasons/seasons_integration_test.go`;
+rate-limit на movies реально блокирует 61-й запрос за 10 минут
+(`TestRateLimitBlocksAfterTooManyRequests`, через настоящую
+auth-middleware-сессию, а не мок). Плюс сквозная проверка через
+`docker compose`: стрим `NOTRECINEMA_DEADLETTER` реально появляется в
+NATS-мониторинге (`:8222`) при старте воркера.
+
+Email-часть season tracking (в notrecinema-app cron- и action-путь шлют
+ещё и email через Resend) не перенесена — та же причина, что и у
+`internal/nudges`: в Go-сервисах нет SMTP-инфраструктуры.
+
+## 16. Auth/2FA/OAuth, удаление аккаунта, участники семьи, импорт, bulk-импорт, загрузка изображений — готово
+
+Всё, что аудит 2026-09-30 нашёл неперенесённым (см. начало документа),
+перенесено тем же днём.
+
+- **`internal/auth`** — логин, регистрация, логаут, 2FA целиком. Пароли —
+  scrypt в том же формате, что `createPasswordHash` в notrecinema-app
+  (`"<hex-соль>:<hex-ключ>"`, `N=16384/r=8/p=1`, 64-байтный ключ) —
+  байт-в-байт совместимо с уже существующими хэшами в БД, заведёнными
+  монолитом. 2FA — `pquerna/otp`, те же дефолты, что otplib (6 цифр, 30с,
+  SHA1, окно ±1) — тоже совместимо с уже включённой у кого-то 2FA. Сессии
+  создаются той же SQL-функцией `create_session_for_profile`, что и
+  раньше, и читаются той же `get_session_user` — два сервиса продолжают
+  видеть одну и ту же сессию независимо от того, кто её выпустил.
+  Rate-limiting на каждом шаге (IP, email, challenge-token) — те же бакеты
+  и лимиты, что в оригинале.
+- **`internal/oauth`** — вход через GitHub: state-cookie (CSRF), обмен
+  кода на токен, обязательная проверка `verified` у email (никогда не
+  доверяет полю `email` из `/user`, только `/user/emails`), привязка к
+  существующему аккаунту по совпадению email через ту же
+  `create_profile_session`, что уже использовалась в тестах этого модуля.
+- **`internal/users.DeleteAccount`** — перепроверка пароля, блокировка,
+  если пользователь владеет семьёй с другими участниками (проверяются ВСЕ
+  семьи, не одна), `delete_own_profile` (SECURITY DEFINER, уже
+  захардено миграцией 0025 под конкретного вызывающего).
+- **Участники семьи** (`internal/families`) — список (владелец первым),
+  удаление участника (только владелец, владельца удалить нельзя), смена
+  роли, передача владения (`transfer_family_ownership`, уже существовала).
+  По пути найден и исправлен настоящий баг схемы: у `family_members`
+  вообще не было UPDATE-политики RLS — `setMemberRoleAction` в оригинале
+  поэтому не мог сработать ни при каких правах вызывающего. Добавлена
+  `set_family_member_role` (SECURITY DEFINER, миграция 0030).
+- **`internal/imports`** — поиск (Kinopoisk через отдельный
+  `api.kinopoisk.dev`, не тот же API, что уже используется для
+  метаданных; OMDb с фан-аутом на детали, раз список не отдаёт
+  жанры/постер), импорт Trakt watchlist (публичный, только client id),
+  разбор CSV-экспорта IMDb (собственный RFC4180-парсер, без сети).
+- **`internal/series.CreateBulk`** — массовый импорт: два отдельных
+  `INSERT` внутри одной транзакции (не один `WITH`-запрос — та же
+  RLS-ловушка с siblings, что описана в комментариях оригинала),
+  `matchBulkImportedRowsToItems` (FIFO по `source:externalId`) сопоставляет
+  вставленные строки с исходными элементами, лимит 500, одно агрегированное
+  уведомление через новый outbox-эвент `series.bulk_added`.
+- **`internal/upload`** — загрузка постера сериала в S3-совместимое
+  хранилище (включая MinIO): собственная подпись AWS4-HMAC-SHA256 (без
+  SDK, как и в оригинале), sniff по магическим байтам (PNG/JPEG/GIF/WebP,
+  намеренно без SVG), лимит 5 МБ, rate-limit по IP и пользователю.
+
+Проверено реальными интеграционными тестами против настоящего Postgres
+(`internal/auth`, `internal/users`, `internal/families`,
+`internal/series` — bulk) и unit-тестами без сети там, где сеть не нужна
+для проверки логики (`internal/imports` CSV-парсер, `internal/upload`
+SigV4-подпись против httptest, `internal/oauth` отказные пути). Плюс
+сквозная проверка через реальный HTTP в `docker compose`: полный цикл
+регистрация → логин → 2FA setup → confirm → повторный логин требует код →
+verify-2fa → disable 2FA → удаление аккаунта → повторный логин
+отклоняется; отдельно — участники семьи, bulk-импорт (с подтверждением,
+что `series.bulk_added` реально дошёл до воркера по логам).
+
+В процессе нашлись и были исправлены два реальных бага:
+- утечка соединений пула в `internal/auth`: `Logout`/`Login`/
+  `VerifyTwoFactor` вызывали `db.Query` для SECURITY DEFINER функций,
+  возвращающих void, и не читали результат — pgx не возвращает соединение
+  в пул, пока `Rows` не исчерпаны или не закрыты явно. На серии таких
+  вызовов пул (20 соединений) исчерпывался, и любой следующий запрос молча
+  зависал без таймаута и без ошибки. Добавлен `postgres.Pool.Exec` —
+  обёртка, которая не может забыть закрыть `Rows`, потому что их вообще не
+  возвращает; все места, писавшие `db.Query(...)` ради побочного эффекта,
+  переведены на неё.
+- отсутствие UPDATE-политики RLS на `family_members` (см. выше) —
+  `setMemberRoleAction` в оригинале был мёртвым кодом, который выглядел
+  рабочим (не бросал ошибку), но никогда реально не менял роль.
+
+### Дополнение (2026-09-30): GitHub OAuth и S3 проверены вживую
+
+На момент написания выше это было не проверено против настоящих внешних
+сервисов — проверено в тот же день:
+
+- **S3 / MinIO.** Поднят реальный MinIO (community-образ `elestio/minio`,
+  официальный `minio/minio` больше не тянется с Docker Hub без логина),
+  создан бакет с публичным чтением. Через настоящий
+  `POST /api/v1/upload/image` загружен настоящий PNG (сгенерированный
+  байт-в-байт, не заглушка) — запрос реально подписан AWS4-HMAC-SHA256 и
+  принят MinIO. Скачан обратно по публичному URL — байты идентичны
+  оригиналу (`cmp` подтвердил). Отдельно проверено, что не-изображение
+  (текстовый файл с `Content-Type: text/plain`) реально отклоняется по
+  сигнатуре байт, а не по заголовку.
+- **GitHub OAuth.** Зарегистрирован настоящий OAuth App на github.com
+  (`notrecinema-local-test`, callback
+  `http://localhost:8090/api/v1/auth/github/callback`). Пройден полный
+  живой флоу в браузере: `GET .../github/start?legalAccepted=true` →
+  реальный редирект на `github.com/login/oauth/authorize` с правильными
+  `redirect_uri`/`scope=read:user user:email` → подтверждение доступа
+  пользователем → редирект обратно на API → обмен кода на токен → запрос
+  `/user` и `/user/emails` → сессия реально выдана: `GET
+  /api/v1/users/me` через тот же браузер вернул настоящие `email`/
+  `displayName` с GitHub. В БД подтверждено `password_hash IS NULL` —
+  аккаунт создан как OAuth-only, как и задумано. Отдельно проверена
+  CSRF-защита: callback с неверным `state` реально отклоняется
+  (`authError=GitHub OAuth state is invalid`), а не тихо пропускает.
+
+Тестовый OAuth App и его client secret видны в истории этой сессии;
+поскольку это локальное one-off приложение с callback на `localhost`, риск
+минимален, но стоит отозвать/перегенерировать secret на
+github.com/settings/developers, если он не нужен для дальнейшей локальной
+разработки.

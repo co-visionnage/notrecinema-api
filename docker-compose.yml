@@ -1,0 +1,122 @@
+# Окружение для разработки и тестирования backend-платформы целиком:
+# API, воркер, Postgres, NATS. Схема БД -- не часть этого файла, а
+# отдельный пакет ../notrecinema-schema: единственный источник истины,
+# которым пользуются notrecinema-app, notrecinema-api и notrecinema-worker.
+services:
+  api:
+    env_file:
+      - .env
+    build: .
+    container_name: notrecinema-api
+    restart: unless-stopped
+    ports:
+      - '8090:8080'
+    environment:
+      NATS_URL: nats://nats:4222
+      OTLP_ENDPOINT: jaeger:4318
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    networks:
+      - notrecinema-api-net
+
+  worker:
+    env_file:
+      - .env
+    build: ../notrecinema-worker
+    container_name: notrecinema-worker
+    restart: unless-stopped
+    ports:
+      - '8091:8081'
+    environment:
+      NATS_URL: nats://nats:4222
+      OTLP_ENDPOINT: jaeger:4318
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    networks:
+      - notrecinema-api-net
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: notrecinema-api-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports:
+      - '16686:16686' # UI
+      - '4318:4318'   # OTLP/HTTP
+    networks:
+      - notrecinema-api-net
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: notrecinema-api-nats
+    restart: unless-stopped
+    command: ['-js', '-sd', '/data', '-m', '8222']
+    ports:
+      - '4222:4222'
+      - '8222:8222'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:8222/healthz || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - notrecinema_api_nats_data:/data
+    networks:
+      - notrecinema-api-net
+
+  migrate:
+    env_file:
+      - .env
+    build:
+      context: ../notrecinema-schema
+    container_name: notrecinema-api-migrate
+    environment:
+      MIGRATE_DATABASE_URL: ${MIGRATE_DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - notrecinema-api-net
+
+  postgres:
+    env_file:
+      - .env
+    image: postgres:16-alpine
+    container_name: notrecinema-api-postgres
+    restart: unless-stopped
+    ports:
+      - '5433:5432'
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    volumes:
+      - notrecinema_api_postgres_data:/var/lib/postgresql/data
+      - ../notrecinema-schema/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - notrecinema-api-net
+
+networks:
+  notrecinema-api-net:
+    driver: bridge
+
+volumes:
+  notrecinema_api_postgres_data:
+  notrecinema_api_nats_data:
