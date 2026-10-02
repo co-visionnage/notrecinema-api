@@ -1,0 +1,160 @@
+# Продакшн-окружение. Образы api и worker приходят из GHCR (их собирает CI),
+# а не собираются на сервере. Наружу публикуются только loopback-порты:
+# внешний доступ -- через nginx (роль nginx в notrecinema-infra).
+# Схема БД лежит рядом: /opt/notrecinema-schema (клонируется notrecinema-infra).
+services:
+  api:
+    image: ghcr.io/co-visionnage/notrecinema-api:${API_IMAGE_TAG:-latest}
+    env_file:
+      - .env
+    container_name: notrecinema-api
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:8090:8080'
+    environment:
+      NATS_URL: nats://nats:4222
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
+    networks:
+      - notrecinema-net
+
+  worker:
+    image: ghcr.io/co-visionnage/notrecinema-worker:${WORKER_IMAGE_TAG:-latest}
+    env_file:
+      - .env
+    container_name: notrecinema-worker
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:8091:8081'
+    environment:
+      NATS_URL: nats://nats:4222
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_healthy
+    networks:
+      - notrecinema-net
+
+  migrate:
+    env_file:
+      - .env
+    build:
+      context: ../notrecinema-schema
+    container_name: notrecinema-migrate
+    environment:
+      MIGRATE_DATABASE_URL: ${MIGRATE_DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - notrecinema-net
+
+  postgres:
+    env_file:
+      - .env
+    image: postgres:16-alpine
+    container_name: notrecinema-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    volumes:
+      - notrecinema_postgres_data:/var/lib/postgresql/data
+      - ../notrecinema-schema/init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - notrecinema-net
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: notrecinema-nats
+    restart: unless-stopped
+    command: ['-js', '-sd', '/data', '-m', '8222']
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:8222/healthz || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - notrecinema_nats_data:/data
+    networks:
+      - notrecinema-net
+
+  # S3-совместимое хранилище картинок (SeaweedFS, Apache-2.0). Ключи доступа
+  # берутся из STORAGE_ACCESS_KEY / STORAGE_SECRET_KEY: конфиг идентичностей
+  # генерируется при старте. Анонимным пользователям разрешено только чтение
+  # объектов нужного бакета (листинг, запись и удаление закрыты).
+  seaweedfs:
+    image: chrislusf/seaweedfs:${SEAWEEDFS_TAG:-latest}
+    env_file:
+      - .env
+    container_name: notrecinema-seaweedfs
+    restart: unless-stopped
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        mkdir -p /etc/seaweedfs
+        cat > /etc/seaweedfs/s3.json <<EOF
+        {
+          "identities": [
+            {"name": "app", "credentials": [{"accessKey": "$$STORAGE_ACCESS_KEY", "secretKey": "$$STORAGE_SECRET_KEY"}], "actions": ["Admin", "Read", "Write", "List"]},
+            {"name": "anonymous", "actions": ["Read:$$STORAGE_BUCKET"]}
+          ]
+        }
+        EOF
+        exec weed server -dir=/data -s3 -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - '127.0.0.1:8333:8333'
+    volumes:
+      - notrecinema_seaweedfs_data:/data
+    networks:
+      - notrecinema-net
+
+  # Одноразово создаёт бакет (идемпотентно: существующий не трогает).
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:${SEAWEEDFS_TAG:-latest}
+    env_file:
+      - .env
+    container_name: notrecinema-seaweedfs-init
+    depends_on:
+      - seaweedfs
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        until echo "s3.bucket.list" | weed shell -master=seaweedfs:9333 > /tmp/buckets 2>&1; do sleep 2; done
+        grep -qw "$$STORAGE_BUCKET" /tmp/buckets || echo "s3.bucket.create -name $$STORAGE_BUCKET" | weed shell -master=seaweedfs:9333
+    networks:
+      - notrecinema-net
+
+  # Приёмник трейсов. Интерфейс только на loopback (доступ через SSH-туннель).
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: notrecinema-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports:
+      - '127.0.0.1:16686:16686'
+    networks:
+      - notrecinema-net
+
+networks:
+  notrecinema-net:
+    driver: bridge
+
+volumes:
+  notrecinema_postgres_data:
+  notrecinema_nats_data:
+  notrecinema_seaweedfs_data:

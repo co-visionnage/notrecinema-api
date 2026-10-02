@@ -188,7 +188,9 @@ jobs:
             "cd $DEPLOY_PATH && \
              git fetch origin && \
              git checkout $GITHUB_SHA && \
-             export IMAGE_TAG=$IMAGE_TAG && \
-             docker compose pull api worker && \
-             docker compose up -d --remove-orphans api worker && \
+             git -C ../notrecinema-schema pull --ff-only && \
+             export API_IMAGE_TAG=$IMAGE_TAG && \
+             docker compose -f docker-compose.prod.yml build migrate && \
+             docker compose -f docker-compose.prod.yml pull api && \
+             docker compose -f docker-compose.prod.yml up -d --remove-orphans api && \
              docker image prune -f"
