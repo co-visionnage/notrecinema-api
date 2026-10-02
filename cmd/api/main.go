@@ -152,6 +152,7 @@ func run(logger *slog.Logger) error {
 	publicMux.HandleFunc("GET /readyz", httpserver.Readyz(db))
 	publicMux.Handle("GET /metrics", metrics.Handler())
 	auth.RegisterRoutes(publicMux, authService)
+	auth.RegisterEmailRoutes(publicMux, authService)
 	oauthService := oauth.NewService(authService, cfg.GitHubClientID, cfg.GitHubClientSecret)
 	if !oauthService.Configured() {
 		logger.Warn("oauth: GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET не заданы, вход через GitHub отключён")
@@ -160,6 +161,7 @@ func run(logger *slog.Logger) error {
 
 	protectedMux := http.NewServeMux()
 	auth.RegisterProtectedRoutes(protectedMux, authService)
+	auth.RegisterProtectedEmailRoutes(protectedMux, authService)
 	users.RegisterRoutes(protectedMux, usersService, authService)
 	families.RegisterRoutes(protectedMux, familiesService)
 	series.RegisterRoutes(protectedMux, seriesService)

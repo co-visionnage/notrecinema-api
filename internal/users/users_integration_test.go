@@ -151,3 +151,100 @@ func TestDeleteAccountSucceedsAndCascades(t *testing.T) {
 		t.Error("Login() succeeded with the deleted account's credentials, want error")
 	}
 }
+
+func TestDeleteAccountQueuesGoodbyeEmailWithAddress(t *testing.T) {
+	db := connectOrSkip(t)
+	ctx := context.Background()
+	authSvc := auth.NewService(db, "notre_cinema_session", "development")
+	usersSvc := users.NewService(db)
+
+	email := randomEmail(t, "goodbye")
+	session, err := authSvc.Register(ctx, email, "Прощай", "correct-horse-battery-1!")
+	if err != nil {
+		t.Fatalf("Register() error: %v", err)
+	}
+
+	if err := usersSvc.DeleteAccount(ctx, session.User.ID, "correct-horse-battery-1!"); err != nil {
+		t.Fatalf("DeleteAccount() error: %v", err)
+	}
+
+	// Профиль уже удалён, поэтому адрес и имя обязаны лежать в самом
+	// событии -- иначе воркеру письмо отправлять будет некуда.
+	var gotEmail, gotName string
+	var gotVerified bool
+	if err := db.QueryRow(ctx, `
+		SELECT payload->>'email', payload->>'displayName', (payload->>'emailVerified')::boolean
+		FROM public.outbox_events
+		WHERE aggregate_id = $1 AND event_type = 'account.deleted'
+	`, session.User.ID).Scan(&gotEmail, &gotName, &gotVerified); err != nil {
+		t.Fatalf("account.deleted event not found: %v", err)
+	}
+	if gotEmail != email || gotName != "Прощай" {
+		t.Errorf("event payload = (%q, %q), want (%q, %q)", gotEmail, gotName, email, "Прощай")
+	}
+	if gotVerified {
+		t.Error("a freshly registered account was never verified, the event must say so")
+	}
+}
+
+func TestDeleteAccountWithWrongPasswordQueuesNothing(t *testing.T) {
+	db := connectOrSkip(t)
+	ctx := context.Background()
+	authSvc := auth.NewService(db, "notre_cinema_session", "development")
+	usersSvc := users.NewService(db)
+
+	session, err := authSvc.Register(ctx, randomEmail(t, "nodelete"), "Test User", "correct-horse-battery-1!")
+	if err != nil {
+		t.Fatalf("Register() error: %v", err)
+	}
+	if err := usersSvc.DeleteAccount(ctx, session.User.ID, "wrong-password-1!"); err == nil {
+		t.Fatal("DeleteAccount() with wrong password succeeded")
+	}
+
+	var n int
+	if err := db.QueryRow(ctx, `
+		SELECT count(*) FROM public.outbox_events WHERE aggregate_id = $1 AND event_type = 'account.deleted'
+	`, session.User.ID).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("account.deleted events after a rejected delete = %d, want 0", n)
+	}
+}
+
+func TestProfileReportsEmailVerification(t *testing.T) {
+	db := connectOrSkip(t)
+	ctx := context.Background()
+	authSvc := auth.NewService(db, "notre_cinema_session", "development")
+	usersSvc := users.NewService(db)
+
+	session, err := authSvc.Register(ctx, randomEmail(t, "profile"), "Test User", "correct-horse-battery-1!")
+	if err != nil {
+		t.Fatalf("Register() error: %v", err)
+	}
+
+	profile, err := usersSvc.GetProfile(ctx, session.User.ID)
+	if err != nil {
+		t.Fatalf("GetProfile() error: %v", err)
+	}
+	if profile.EmailVerified {
+		t.Error("a new password account must start unverified")
+	}
+
+	tokenHash := randomEmail(t, "token-hash")
+	if err := db.Exec(ctx, `SELECT public.create_email_token($1, 'verify_email', $2, NOW() + interval '1 hour')`, session.User.ID, tokenHash); err != nil {
+		t.Fatalf("create_email_token: %v", err)
+	}
+	var ok bool
+	if err := db.QueryRow(ctx, `SELECT public.verify_email_with_token($1)`, tokenHash).Scan(&ok); err != nil || !ok {
+		t.Fatalf("verify_email_with_token: ok=%v err=%v", ok, err)
+	}
+
+	profile, err = usersSvc.GetProfile(ctx, session.User.ID)
+	if err != nil {
+		t.Fatalf("GetProfile() error: %v", err)
+	}
+	if !profile.EmailVerified {
+		t.Error("profile still reports unverified after verification")
+	}
+}

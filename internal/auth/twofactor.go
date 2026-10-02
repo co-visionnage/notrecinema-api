@@ -11,6 +11,7 @@ import (
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 
+	"notrecinema/api/internal/outbox"
 	"notrecinema/api/internal/platform/apperror"
 )
 
@@ -106,8 +107,10 @@ func (s *Service) ConfirmTwoFactor(ctx context.Context, userID, code string) err
 			return apperror.Invalid("неверный код")
 		}
 
-		_, err := tx.Exec(ctx, `UPDATE public.profiles SET totp_enabled = true WHERE id = $1`, userID)
-		return err
+		if _, err := tx.Exec(ctx, `UPDATE public.profiles SET totp_enabled = true WHERE id = $1`, userID); err != nil {
+			return err
+		}
+		return outbox.Insert(ctx, tx, "profile", userID, "security.two_factor_enabled", map[string]string{"userId": userID})
 	})
 }
 
@@ -125,10 +128,12 @@ func (s *Service) DisableTwoFactor(ctx context.Context, userID, code string) err
 			return apperror.Invalid("неверный код")
 		}
 
-		_, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE public.profiles SET totp_enabled = false, totp_secret = NULL WHERE id = $1
-		`, userID)
-		return err
+		`, userID); err != nil {
+			return err
+		}
+		return outbox.Insert(ctx, tx, "profile", userID, "security.two_factor_disabled", map[string]string{"userId": userID})
 	})
 }
 

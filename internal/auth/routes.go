@@ -50,6 +50,19 @@ type loginResponse struct {
 	ChallengeToken    string `json:"challengeToken,omitempty"`
 }
 
+// passwordProblem возвращает текст ошибки для слабого пароля или "" для
+// допустимого. Общая для входа/регистрации и для сброса пароля: один и
+// тот же набор правил в обоих местах.
+func passwordProblem(password string) string {
+	if len(password) < 8 {
+		return "пароль должен быть не короче 8 символов"
+	}
+	if !hasLetter.MatchString(password) || !hasDigit.MatchString(password) || !hasSpecial.MatchString(password) {
+		return "пароль должен содержать буквы, цифры и хотя бы один спецсимвол"
+	}
+	return ""
+}
+
 func writeAuthError(w http.ResponseWriter, status int, message string) {
 	response.JSON(w, status, map[string]string{"error": message})
 }
@@ -89,12 +102,8 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 			writeAuthError(w, http.StatusBadRequest, "введите корректный email-адрес")
 			return
 		}
-		if len(req.Password) < 8 {
-			writeAuthError(w, http.StatusBadRequest, "пароль должен быть не короче 8 символов")
-			return
-		}
-		if !hasLetter.MatchString(req.Password) || !hasDigit.MatchString(req.Password) || !hasSpecial.MatchString(req.Password) {
-			writeAuthError(w, http.StatusBadRequest, "пароль должен содержать буквы, цифры и хотя бы один спецсимвол")
+		if problem := passwordProblem(req.Password); problem != "" {
+			writeAuthError(w, http.StatusBadRequest, problem)
 			return
 		}
 

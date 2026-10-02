@@ -14,16 +14,18 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"notrecinema/api/internal/auth"
+	"notrecinema/api/internal/outbox"
 	"notrecinema/api/internal/platform/apperror"
 	"notrecinema/api/internal/platform/response"
 	"notrecinema/api/internal/postgres"
 )
 
 type Profile struct {
-	ID          string `json:"id"`
-	Email       string `json:"email"`
-	DisplayName string `json:"displayName,omitempty"`
-	AvatarURL   string `json:"avatarUrl,omitempty"`
+	ID            string `json:"id"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"emailVerified"`
+	DisplayName   string `json:"displayName,omitempty"`
+	AvatarURL     string `json:"avatarUrl,omitempty"`
 }
 
 type Service struct {
@@ -41,10 +43,10 @@ func (s *Service) GetProfile(ctx context.Context, userID string) (Profile, error
 		var displayName, avatarURL *string
 
 		row := tx.QueryRow(ctx,
-			`SELECT id, email, display_name, avatar_url FROM public.profiles WHERE id = $1`,
+			`SELECT id, email, email_verified_at IS NOT NULL, display_name, avatar_url FROM public.profiles WHERE id = $1`,
 			userID,
 		)
-		if err := row.Scan(&profile.ID, &profile.Email, &displayName, &avatarURL); err != nil {
+		if err := row.Scan(&profile.ID, &profile.Email, &profile.EmailVerified, &displayName, &avatarURL); err != nil {
 			return err
 		}
 		if displayName != nil {
@@ -117,6 +119,28 @@ func (s *Service) DeleteAccount(ctx context.Context, userID, password string) er
 				"вы владелец семей с другими участниками (%s). Сначала передайте владение в каждой из них, потом удаляйте аккаунт",
 				strings.Join(blockingFamilies, ", "),
 			))
+		}
+
+		// Письмо об удалении уходит на адрес, который после удаления уже
+		// не восстановить из БД, поэтому email и имя кладутся в событие
+		// заранее, в той же транзакции.
+		var email string
+		var displayName *string
+		var emailVerified bool
+		if err := tx.QueryRow(ctx, `
+			SELECT email, display_name, email_verified_at IS NOT NULL FROM public.profiles WHERE id = $1
+		`, userID).Scan(&email, &displayName, &emailVerified); err != nil {
+			return err
+		}
+		// emailVerified нужен воркеру: прощальное письмо уходит только на
+		// подтверждённый адрес, иначе удаление чужого незавершённого
+		// аккаунта-«двойника» слало бы письма владельцу адреса.
+		eventPayload := map[string]any{"email": email, "emailVerified": emailVerified}
+		if displayName != nil {
+			eventPayload["displayName"] = *displayName
+		}
+		if err := outbox.Insert(ctx, tx, "profile", userID, "account.deleted", eventPayload); err != nil {
+			return err
 		}
 
 		_, err = tx.Exec(ctx, `SELECT public.delete_own_profile($1)`, userID)
