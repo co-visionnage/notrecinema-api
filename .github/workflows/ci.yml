@@ -30,7 +30,7 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.11
           args: --timeout 5m ./...
@@ -86,6 +86,8 @@ jobs:
       MIGRATE_DATABASE_URL: postgresql://postgres:ci-postgres-password@localhost:5432/notrecinema_ci
       DATABASE_URL: postgresql://app_user:ci-app-password@localhost:5432/notrecinema_ci
       NATS_URL: nats://localhost:4222
+      PGHOST: localhost
+      PGPASSWORD: ci-postgres-password
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -98,20 +100,20 @@ jobs:
       - name: Clone and apply schema
         run: |
           git clone --depth 1 "$SCHEMA_REPO_URL" /tmp/notrecinema-schema
-          cd /tmp/notrecinema-schema && npm install && npm run migrate
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          cd /tmp/notrecinema-schema
+          sh init.sh
+          npm install
+          npm run migrate
       - run: go test -tags integration ./... -v
 
   trivy-filesystem-scan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: fs
-          scanners: vuln,secret,misconfig
-          severity: HIGH,CRITICAL
-          format: table
-          exit-code: '0'
+      - name: Trivy filesystem scan
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work aquasec/trivy:0.58.0             fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 0 --format table .
 
   govulncheck:
     runs-on: ubuntu-latest
@@ -156,12 +158,13 @@ jobs:
     needs: build-image
     runs-on: ubuntu-latest
     steps:
-      - uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-image.outputs.image-tag }}
-          severity: HIGH,CRITICAL
-          format: table
-          exit-code: '0'
+      - name: Trivy image scan
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-image.outputs.image-tag }}
+        run: |
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD aquasec/trivy:0.58.0             image --severity HIGH,CRITICAL --exit-code 0 --format table "$IMAGE_REF"
 
   deploy-production:
     needs: build-image
