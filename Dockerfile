@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /src
 # Shown in the build_info metric and in logs; CI passes the commit hash.
 ARG VERSION=dev
