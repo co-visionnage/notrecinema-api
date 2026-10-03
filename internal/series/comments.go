@@ -17,15 +17,35 @@ import (
 )
 
 type Comment struct {
-	ID        string    `json:"id"`
-	SeriesID  string    `json:"seriesId"`
-	UserID    string    `json:"userId"`
-	Body      string    `json:"body"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID       string `json:"id"`
+	SeriesID string `json:"seriesId"`
+	UserID   string `json:"userId"`
+	// AuthorName -- имя автора (display_name, а если его нет -- email).
+	AuthorName     string    `json:"authorName"`
+	Body           string    `json:"body"`
+	CreatedAt      time.Time `json:"createdAt"`
+	SpoilerSeason  *int      `json:"spoilerSeason,omitempty"`
+	SpoilerEpisode *int      `json:"spoilerEpisode,omitempty"`
 }
 
 type CreateCommentInput struct {
 	Body string `json:"body"`
+	// SpoilerSeason/SpoilerEpisode -- необязательная пометка "спойлер до
+	// этой серии"; эпизод без сезона не имеет смысла.
+	SpoilerSeason  *int `json:"spoilerSeason"`
+	SpoilerEpisode *int `json:"spoilerEpisode"`
+}
+
+const commentSelect = `
+	SELECT c.id, c.series_id, c.user_id, COALESCE(p.display_name, p.email), c.body, c.created_at,
+	       c.spoiler_season, c.spoiler_episode
+	FROM public.family_series_comments c
+	JOIN public.profiles p ON p.id = c.user_id`
+
+func scanComment(row pgx.Row) (Comment, error) {
+	var c Comment
+	err := row.Scan(&c.ID, &c.SeriesID, &c.UserID, &c.AuthorName, &c.Body, &c.CreatedAt, &c.SpoilerSeason, &c.SpoilerEpisode)
+	return c, err
 }
 
 func (s *Service) AddComment(ctx context.Context, userID, seriesID string, in CreateCommentInput) (Comment, error) {
@@ -37,14 +57,26 @@ func (s *Service) AddComment(ctx context.Context, userID, seriesID string, in Cr
 		return Comment{}, apperror.Invalid("body must be at most 2000 characters")
 	}
 
+	if in.SpoilerSeason != nil && *in.SpoilerSeason < 1 {
+		return Comment{}, apperror.Invalid("spoilerSeason must be positive")
+	}
+	if in.SpoilerEpisode != nil && (in.SpoilerSeason == nil || *in.SpoilerEpisode < 0) {
+		return Comment{}, apperror.Invalid("spoilerEpisode requires spoilerSeason and must not be negative")
+	}
+
 	var comment Comment
 	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `
-			INSERT INTO public.family_series_comments (series_id, user_id, body)
-			VALUES ($1, $2, $3)
-			RETURNING id, series_id, user_id, body, created_at
-		`, seriesID, userID, body)
-		return row.Scan(&comment.ID, &comment.SeriesID, &comment.UserID, &comment.Body, &comment.CreatedAt)
+		var id string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO public.family_series_comments (series_id, user_id, body, spoiler_season, spoiler_episode)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING id
+		`, seriesID, userID, body, in.SpoilerSeason, in.SpoilerEpisode).Scan(&id); err != nil {
+			return err
+		}
+		var err error
+		comment, err = scanComment(tx.QueryRow(ctx, commentSelect+` WHERE c.id = $1`, id))
+		return err
 	})
 	if err != nil {
 		if postgres.IsForeignKeyViolation(err) {
@@ -58,11 +90,9 @@ func (s *Service) AddComment(ctx context.Context, userID, seriesID string, in Cr
 func (s *Service) ListComments(ctx context.Context, userID, seriesID string) ([]Comment, error) {
 	var list []Comment
 	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT id, series_id, user_id, body, created_at
-			FROM public.family_series_comments
-			WHERE series_id = $1
-			ORDER BY created_at ASC
+		rows, err := tx.Query(ctx, commentSelect+`
+			WHERE c.series_id = $1
+			ORDER BY c.created_at ASC
 		`, seriesID)
 		if err != nil {
 			return err
@@ -70,8 +100,8 @@ func (s *Service) ListComments(ctx context.Context, userID, seriesID string) ([]
 		defer rows.Close()
 
 		for rows.Next() {
-			var c Comment
-			if err := rows.Scan(&c.ID, &c.SeriesID, &c.UserID, &c.Body, &c.CreatedAt); err != nil {
+			c, err := scanComment(rows)
+			if err != nil {
 				return err
 			}
 			list = append(list, c)

@@ -9,6 +9,7 @@ package activitylog
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -49,8 +50,16 @@ func NewService(db *postgres.Pool) *Service {
 	return &Service{db: db}
 }
 
-func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([]Entry, error) {
-	var entries []Entry
+const pageSize = 50
+
+// Page -- страница журнала: pageSize записей и признак, что есть ещё.
+type Page struct {
+	Entries []Entry `json:"entries"`
+	HasMore bool    `json:"hasMore"`
+}
+
+func (s *Service) ListForFamily(ctx context.Context, userID, familyID string, offset int) (Page, error) {
+	page := Page{Entries: []Entry{}}
 
 	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
@@ -58,8 +67,8 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 			FROM public.family_activity_log
 			WHERE family_id = $1
 			ORDER BY created_at DESC
-			LIMIT 200
-		`, familyID)
+			LIMIT $2 OFFSET $3
+		`, familyID, pageSize+1, offset)
 		if err != nil {
 			return err
 		}
@@ -70,18 +79,19 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 			if err := rows.Scan(&e.ID, &e.ActorLabel, &e.Action, &e.TargetLabel, &e.Detail, &e.CreatedAt); err != nil {
 				return err
 			}
-			entries = append(entries, e)
+			page.Entries = append(page.Entries, e)
 		}
 		return rows.Err()
 	})
 	if err != nil {
-		return nil, apperror.Internal("failed to list activity log", err)
+		return Page{}, apperror.Internal("failed to list activity log", err)
 	}
 
-	if entries == nil {
-		entries = []Entry{}
+	if len(page.Entries) > pageSize {
+		page.HasMore = true
+		page.Entries = page.Entries[:pageSize]
 	}
-	return entries, nil
+	return page, nil
 }
 
 func RegisterRoutes(mux *http.ServeMux, svc *Service) {
@@ -89,11 +99,18 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 		user := auth.UserFromContext(r.Context())
 		familyID := r.PathValue("familyId")
 
-		entries, err := svc.ListForFamily(r.Context(), user.ID, familyID)
+		offset := 0
+		if raw := r.URL.Query().Get("offset"); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+				offset = parsed
+			}
+		}
+
+		page, err := svc.ListForFamily(r.Context(), user.ID, familyID, offset)
 		if err != nil {
 			response.Error(w, err)
 			return
 		}
-		response.JSON(w, http.StatusOK, entries)
+		response.JSON(w, http.StatusOK, page)
 	})
 }

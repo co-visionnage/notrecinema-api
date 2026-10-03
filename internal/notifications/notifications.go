@@ -22,6 +22,8 @@ import (
 
 type Service struct {
 	db *postgres.Pool
+	// unsubscribeSecret -- HMAC-ключ ссылок отписки (см. preferences.go).
+	unsubscribeSecret []byte
 }
 
 func NewService(db *postgres.Pool) *Service {

@@ -129,7 +129,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 				return
 			}
 
-			session, err := svc.Register(r.Context(), email, displayName, req.Password)
+			session, err := svc.Register(WithRequest(r.Context(), r), email, displayName, req.Password)
 			if err != nil {
 				writeAuthError(w, apperror.HTTPStatus(err), apperror.PublicMessage(err))
 				return
@@ -148,7 +148,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 				return
 			}
 
-			result, err := svc.Login(r.Context(), email, req.Password)
+			result, err := svc.Login(WithRequest(r.Context(), r), email, req.Password)
 			if err != nil {
 				writeAuthError(w, apperror.HTTPStatus(err), apperror.PublicMessage(err))
 				return
@@ -209,7 +209,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 			return
 		}
 
-		session, err := svc.VerifyTwoFactor(r.Context(), req.ChallengeToken, req.Code)
+		session, err := svc.VerifyTwoFactor(WithRequest(r.Context(), r), req.ChallengeToken, req.Code)
 		if err != nil {
 			writeAuthError(w, apperror.HTTPStatus(err), apperror.PublicMessage(err))
 			return

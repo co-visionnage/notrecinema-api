@@ -4,17 +4,15 @@ import (
 	"context"
 	"net/http"
 	"strings"
+
+	"notrecinema/api/internal/platform/ratelimit"
 )
 
 // checkRateLimit — прямой перенос checkRateLimit из notrecinema-app:
 // фиксированное окно поверх той же SQL-функции check_rate_limit (миграция
 // 0016), которой уже пользуется internal/calendar и internal/seasons.
 func (s *Service) checkRateLimit(ctx context.Context, bucketKey string, maxAttempts, windowSeconds int) (bool, error) {
-	var allowed bool
-	err := s.db.QueryRow(ctx, `
-		SELECT public.check_rate_limit($1, $2, $3)
-	`, bucketKey, maxAttempts, windowSeconds).Scan(&allowed)
-	return allowed, err
+	return ratelimit.Check(ctx, s.db, bucketKey, maxAttempts, windowSeconds)
 }
 
 // clientIP — прямой перенос getClientIp: X-Real-IP (проставляется

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"slices"
 	"time"
+
+	"notrecinema/api/internal/telemetry"
 )
 
 type contextKey int
@@ -83,6 +85,7 @@ func Recover(logger *slog.Logger) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if recovered := recover(); recovered != nil {
+					telemetry.RecordPanic()
 					logger.Error("http_panic_recovered",
 						"panic", recovered,
 						"path", r.URL.Path,

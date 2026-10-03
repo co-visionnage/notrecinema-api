@@ -8,6 +8,7 @@ import (
 
 	"notrecinema/api/internal/auth"
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/platform/ratelimit"
 	"notrecinema/api/internal/platform/response"
 	"notrecinema/api/internal/postgres"
 )
@@ -86,9 +87,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service, db *postgres.Pool) {
 }
 
 func checkRateLimit(ctx context.Context, db *postgres.Pool, bucketKey string, maxAttempts, windowSeconds int) (bool, error) {
-	var allowed bool
-	err := db.QueryRow(ctx, `SELECT public.check_rate_limit($1, $2, $3)`, bucketKey, maxAttempts, windowSeconds).Scan(&allowed)
-	return allowed, err
+	return ratelimit.Check(ctx, db, bucketKey, maxAttempts, windowSeconds)
 }
 
 // clientIP -- та же логика, что auth.clientIP (X-Real-Ip, иначе последний

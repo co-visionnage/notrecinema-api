@@ -142,6 +142,17 @@ func TestPollCreateVoteClose(t *testing.T) {
 	if len(listed) != 1 || listed[0].Options[0].Votes != 1 {
 		t.Fatalf("ListForFamily() = %+v, want 1 poll с 1 голосом", listed)
 	}
+	// Вариант приходит с карточкой сериала, а "я голосовал" -- у каждого своё.
+	if listed[0].Options[0].Title == "" {
+		t.Errorf("option without a title: %+v", listed[0].Options[0])
+	}
+	asVoter, err := svc.ListForFamily(ctx, voter, familyID)
+	if err != nil || !asVoter[0].Options[0].VotedByMe {
+		t.Errorf("voter does not see votedByMe: %+v, %v", asVoter, err)
+	}
+	if listed[0].Options[0].VotedByMe {
+		t.Error("owner did not vote, but votedByMe is true")
+	}
 
 	// Голосование за несуществующую опцию должно быть отклонено RLS
 	// (family_watch_poll_votes_upsert_own проверяет, что опция реально

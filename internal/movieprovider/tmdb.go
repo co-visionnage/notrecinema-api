@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"notrecinema/api/internal/telemetry"
 )
 
 const tmdbBaseURL = "https://api.themoviedb.org/3"
@@ -19,7 +21,7 @@ type TMDB struct {
 
 func NewTMDB(apiKey string, httpClient *http.Client) *TMDB {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = telemetry.InstrumentedClient()
 	}
 	return &TMDB{apiKey: apiKey, baseURL: tmdbBaseURL, httpClient: httpClient}
 }

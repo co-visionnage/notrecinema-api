@@ -22,6 +22,10 @@ type User struct {
 	ID          string
 	Email       string
 	DisplayName string
+	// SessionID -- строка app_sessions, по которой пользователь вошёл
+	// сейчас: нужна, чтобы в списке сессий отметить текущую и не закрыть её
+	// случайно при «выйти везде, кроме этого устройства».
+	SessionID string
 }
 
 type contextKey int
@@ -55,13 +59,13 @@ func hashToken(token string) string {
 // пользовательского контекста для её ограничения ещё нет, именно его
 // и устанавливает этот вызов.
 func (s *Service) sessionUser(ctx context.Context, token string) (*User, error) {
-	row := s.db.QueryRow(ctx, "SELECT user_id, email, display_name FROM public.get_session_user($1::text)", hashToken(token))
+	row := s.db.QueryRow(ctx, "SELECT session_id, user_id, email, display_name FROM public.get_session_user($1::text)", hashToken(token))
 
 	var (
 		user        User
 		displayName *string
 	)
-	if err := row.Scan(&user.ID, &user.Email, &displayName); err != nil {
+	if err := row.Scan(&user.SessionID, &user.ID, &user.Email, &displayName); err != nil {
 		return nil, err
 	}
 	if displayName != nil {

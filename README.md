@@ -103,11 +103,12 @@ curl localhost:8090/readyz    # readiness -- падает, если Postgres н�
 ```
 POST   /api/v1/auth/login            -- {mode: login|register, email, password, ...}
 POST   /api/v1/auth/logout
-POST   /api/v1/auth/verify-2fa       -- {challengeToken, code} -- второй шаг логина с включённой 2FA
+POST   /api/v1/auth/verify-2fa       -- {challengeToken, code} -- второй шаг логина с включённой 2FA; code -- из приложения или резервный
 POST   /api/v1/auth/2fa/setup        -- возвращает {secret, qrCodeDataUrl}
-POST   /api/v1/auth/2fa/confirm      -- {code}
+POST   /api/v1/auth/2fa/confirm      -- {code} -> {backupCodes}: 10 резервных кодов, показываются один раз
 POST   /api/v1/auth/2fa/disable      -- {code}
-GET    /api/v1/auth/2fa/status       -- {enabled}
+GET    /api/v1/auth/2fa/status       -- {enabled, backupCodesRemaining}
+POST   /api/v1/auth/2fa/backup-codes/regenerate  -- {code} -> {backupCodes}, старые коды перестают работать
 GET    /api/v1/auth/github/start     -- редирект на GitHub (требует ?legalAccepted=true)
 GET    /api/v1/auth/github/callback
 
@@ -122,7 +123,13 @@ DELETE /api/v1/families/{familyId}/members/{userId}       -- только вла
 PUT    /api/v1/families/{familyId}/members/{userId}/role  -- {role: admin|member}, только владелец
 POST   /api/v1/families/{familyId}/transfer-ownership     -- {newOwnerUserId}
 
-GET    /api/v1/families/{familyId}/series
+GET    /api/v1/families/{familyId}/series   -- сериалы со статусом/оценкой ТЕКУЩЕГО пользователя
+POST   /api/v1/families/{familyId}/series   -- + mediaType, trailerUrl, externalSource/Id, status/rating/comment
+PATCH  /api/v1/series/{seriesId}            -- rating и comment пишутся в статус вызывающего
+
+GET    /api/v1/families/{familyId}/progress -- прогресс всех участников по всем сериалам одним запросом
+GET    /api/v1/series/{seriesId}/progress/all
+GET    /api/v1/families/{familyId}/activity?offset=   -- {entries, hasMore}, по 50
 POST   /api/v1/families/{familyId}/series
 POST   /api/v1/families/{familyId}/series/bulk   -- {items[]} -- массовый импорт (до 500), одно агрегированное уведомление
 GET    /api/v1/series/{seriesId}
@@ -200,6 +207,56 @@ GET  /api/v1/users/me                          -- теперь с полем ema
 сброс 1 час; после сброса пароля сессии на всех устройствах закрываются.
 Лимиты запросов -- через `check_rate_limit`, как и у логина.
 
+### Резервные коды 2FA
+
+При включении 2FA выдаётся 10 одноразовых кодов вида `xxxxx-xxxxx`; хранятся
+только scrypt-хеши, показать их повторно нельзя -- можно выпустить новый
+набор (старый перестаёт работать). Код принимается на втором шаге входа
+вместо кода из приложения; использование резервного кода и перевыпуск
+сопровождаются письмом о безопасности.
+
+### Пароль и сессии
+
+```
+POST   /api/v1/auth/password/change    -- {currentPassword, newPassword, confirmPassword}; остальные сессии закрываются
+GET    /api/v1/auth/sessions           -- {sessions: [{id, current, ip, userAgent, createdAt, lastSeenAt, expiresAt}]}
+DELETE /api/v1/auth/sessions/{id}      -- закрыть сессию (текущую -- это выход)
+DELETE /api/v1/auth/sessions           -- закрыть все, кроме текущей
+```
+
+У пользователя может быть несколько сессий (не больше 20, самые старые
+удаляются); вход на новом устройстве не закрывает остальные.
+
+### Уведомления и отписка
+
+```
+GET  /api/v1/notification-preferences   -- {preferences: [{category, push, email, emailSupported}]}
+PUT  /api/v1/notification-preferences   -- {preferences: [{category, push, email}]}
+POST /api/v1/unsubscribe                -- {token} или ?token=: отписка от писем категории по ссылке из письма
+```
+
+Категории: `series_added`, `season_update`, `progress_reminder` (письма
+включены по умолчанию), `series_watched`, `series_rated`, `poll`,
+`watch_event`, `member_joined` (только push). Токен отписки -- HMAC без
+состояния на `UNSUBSCRIBE_SECRET` (общий с воркером); отписка только по POST,
+чтобы почтовые сканеры не отписывали людей сами (RFC 8058 One-Click).
+
+### Приглашение в семью по email
+
+```
+POST   /api/v1/families/{familyId}/invitations                       -- {email}; владелец и админы
+GET    /api/v1/families/{familyId}/invitations                       -- ожидающие
+POST   /api/v1/families/{familyId}/invitations/{id}/resend
+DELETE /api/v1/families/{familyId}/invitations/{id}                  -- отозвать
+GET    /api/v1/invitations/preview?token=                            -- публичный: {familyName, inviterName}
+POST   /api/v1/invitations/accept                                    -- {token}; нужна сессия
+```
+
+Письмо с ссылкой `/invite?token=...` строит воркер (в событии только id,
+сам токен создаётся при отправке, в БД лежит его хеш). Вступление
+попадает в журнал активности и порождает событие `family.member.joined`.
+Вход в семью по коду (`/families/join`) ограничен 10 попытками за 10 минут.
+
 Права нигде не проверяются дважды: Go-слой доверяет RLS-политикам из
 `notrecinema-schema` (членство в семье, авторство, владение) и просто
 транслирует их отказ в 403/404 -- см. комментарии в исходниках
@@ -207,6 +264,10 @@ GET  /api/v1/users/me                          -- теперь с полем ema
 именно миграция отвечает за какое правило.
 
 ## Observability
+
+Полный список метрик, меток и предлагаемых алертов -- в
+[`docs/METRICS.md`](docs/METRICS.md). `/metrics` наружу не публикуется:
+nginx из `notrecinema-infra` отвечает на него 404.
 
 ```bash
 curl localhost:8090/metrics     # Prometheus-метрики API

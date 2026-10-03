@@ -179,13 +179,21 @@ func (p *Poller) recordPending(ctx context.Context) {
 		return
 	}
 
-	var pending int64
-	row := p.db.QueryRow(ctx, `SELECT count(*) FROM public.outbox_events WHERE published_at IS NULL`)
-	if err := row.Scan(&pending); err != nil {
+	var (
+		pending    int64
+		oldestSecs float64
+	)
+	row := p.db.QueryRow(ctx, `
+		SELECT count(*), COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(created_at)), 0)
+		FROM public.outbox_events
+		WHERE published_at IS NULL
+	`)
+	if err := row.Scan(&pending, &oldestSecs); err != nil {
 		p.logger.Warn("outbox: не удалось обновить метрику outbox_pending", "error", err)
 		return
 	}
 	p.metrics.OutboxPending.Set(float64(pending))
+	p.metrics.OutboxOldestPendingAge.Set(oldestSecs)
 }
 
 // publishOne публикует одно событие в отдельном спане: так в Jaeger видно
@@ -212,7 +220,11 @@ func (p *Poller) publishOne(ctx context.Context, tx pgx.Tx, e event) error {
 		return fmt.Errorf("marshal envelope for %s: %w", e.ID, marshalErr)
 	}
 
+	publishStarted := time.Now()
 	publishErr := p.publisher.Publish(spanCtx, e.EventType, envelope)
+	if p.metrics != nil {
+		p.metrics.OutboxPublishDuration.Observe(time.Since(publishStarted).Seconds())
+	}
 	if publishErr != nil {
 		span.RecordError(publishErr)
 		span.SetStatus(codes.Error, "publish")
@@ -240,6 +252,7 @@ func (p *Poller) publishOne(ctx context.Context, tx pgx.Tx, e event) error {
 
 	if p.metrics != nil {
 		p.metrics.OutboxPublishedTotal.Inc()
+		p.metrics.OutboxEventsPublished.WithLabelValues(e.EventType).Inc()
 	}
 	return nil
 }

@@ -23,14 +23,16 @@ import (
 )
 
 type RSVP struct {
-	UserID string `json:"userId"`
-	Status string `json:"status"`
+	UserID      string `json:"userId"`
+	DisplayName string `json:"displayName"`
+	Status      string `json:"status"`
 }
 
 type Event struct {
 	ID          string    `json:"id"`
 	FamilyID    string    `json:"familyId"`
 	SeriesID    *string   `json:"seriesId,omitempty"`
+	SeriesTitle *string   `json:"seriesTitle,omitempty"`
 	CreatedBy   string    `json:"createdBy"`
 	Title       string    `json:"title"`
 	ScheduledAt time.Time `json:"scheduledAt"`
@@ -73,6 +75,14 @@ func (s *Service) Create(ctx context.Context, userID, familyID string, in Create
 		}
 		event.RSVPs = []RSVP{}
 
+		// Создатель встречи по умолчанию идёт.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO public.family_watch_event_rsvps (event_id, user_id, status)
+			VALUES ($1, $2, 'going')
+		`, event.ID, userID); err != nil {
+			return err
+		}
+
 		if err := activitylog.Insert(ctx, tx, familyID, userID, "участник", "watch_event.created", &event.Title, nil); err != nil {
 			return err
 		}
@@ -94,10 +104,11 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 
 	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT id, family_id, series_id, created_by, title, scheduled_at, created_at
-			FROM public.family_watch_events
-			WHERE family_id = $1
-			ORDER BY scheduled_at ASC
+			SELECT e.id, e.family_id, e.series_id, fs.title, e.created_by, e.title, e.scheduled_at, e.created_at
+			FROM public.family_watch_events e
+			LEFT JOIN public.family_series fs ON fs.id = e.series_id
+			WHERE e.family_id = $1
+			ORDER BY e.scheduled_at ASC
 		`, familyID)
 		if err != nil {
 			return err
@@ -107,7 +118,7 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 		var order []string
 		for rows.Next() {
 			var e Event
-			if err := rows.Scan(&e.ID, &e.FamilyID, &e.SeriesID, &e.CreatedBy, &e.Title, &e.ScheduledAt, &e.CreatedAt); err != nil {
+			if err := rows.Scan(&e.ID, &e.FamilyID, &e.SeriesID, &e.SeriesTitle, &e.CreatedBy, &e.Title, &e.ScheduledAt, &e.CreatedAt); err != nil {
 				rows.Close()
 				return err
 			}
@@ -123,9 +134,10 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 		}
 
 		rsvpRows, err := tx.Query(ctx, `
-			SELECT event_id, user_id, status
-			FROM public.family_watch_event_rsvps
-			WHERE event_id = ANY($1)
+			SELECT r.event_id, r.user_id, COALESCE(p.display_name, p.email), r.status
+			FROM public.family_watch_event_rsvps r
+			JOIN public.profiles p ON p.id = r.user_id
+			WHERE r.event_id = ANY($1)
 		`, order)
 		if err != nil {
 			return err
@@ -135,7 +147,7 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 		for rsvpRows.Next() {
 			var eventID string
 			var r RSVP
-			if err := rsvpRows.Scan(&eventID, &r.UserID, &r.Status); err != nil {
+			if err := rsvpRows.Scan(&eventID, &r.UserID, &r.DisplayName, &r.Status); err != nil {
 				return err
 			}
 			if e, ok := byID[eventID]; ok {

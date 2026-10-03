@@ -19,8 +19,10 @@ import (
 
 	"notrecinema/api/internal/auth"
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/platform/ratelimit"
 	"notrecinema/api/internal/platform/response"
 	"notrecinema/api/internal/postgres"
+	"notrecinema/api/internal/telemetry"
 )
 
 const (
@@ -49,7 +51,7 @@ type Service struct {
 }
 
 func NewService(db *postgres.Pool, apiKey string, logger *slog.Logger) *Service {
-	return &Service{db: db, httpClient: http.DefaultClient, apiKey: apiKey, logger: logger}
+	return &Service{db: db, httpClient: telemetry.InstrumentedClient(), apiKey: apiKey, logger: logger}
 }
 
 func (s *Service) Configured() bool {
@@ -178,10 +180,8 @@ func (s *Service) CheckNextEpisode(ctx context.Context, userID, seriesID string)
 	// Бакет "season-check:user:" -- тот же, что и у internal/seasons
 	// (CheckSeriesUpdates): в notrecinema-app обе разовые проверки по
 	// внешним API делят одну квоту, а не считаются раздельно.
-	var allowed bool
-	if err := s.db.QueryRow(ctx, `
-		SELECT public.check_rate_limit($1, $2, $3)
-	`, "season-check:user:"+userID, rateLimitMaxAttempts, rateLimitWindowSecond).Scan(&allowed); err != nil {
+	allowed, err := ratelimit.Check(ctx, s.db, "season-check:user:"+userID, rateLimitMaxAttempts, rateLimitWindowSecond)
+	if err != nil {
 		return Entry{}, apperror.Internal("failed to check rate limit", err)
 	}
 	if !allowed {
@@ -294,7 +294,10 @@ func (s *Service) RunPeriodicRefresh(ctx context.Context, interval time.Duration
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.RefreshAll(ctx); err != nil {
+			started := time.Now()
+			err := s.RefreshAll(ctx)
+			telemetry.RecordJob("calendar_refresh", started, err)
+			if err != nil {
 				s.logger.Error("calendar: ошибка массового обновления", "error", err)
 			}
 		}

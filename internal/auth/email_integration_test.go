@@ -305,7 +305,7 @@ func TestTwoFactorChangesQueueSecurityEmails(t *testing.T) {
 	if got := countEvents(t, db, session.User.ID, "security.two_factor_enabled"); got != 0 {
 		t.Errorf("enabled events before confirm = %d, want 0", got)
 	}
-	if err := svc.ConfirmTwoFactor(ctx, session.User.ID, code); err != nil {
+	if _, err := svc.ConfirmTwoFactor(ctx, session.User.ID, code); err != nil {
 		t.Fatalf("ConfirmTwoFactor() error: %v", err)
 	}
 	if got := countEvents(t, db, session.User.ID, "security.two_factor_enabled"); got != 1 {

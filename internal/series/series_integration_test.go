@@ -235,3 +235,112 @@ func TestCommentsAndReactions(t *testing.T) {
 }
 
 func intPtr(v int) *int { return &v }
+
+func strPtr(s string) *string { return &s }
+
+// Тип, трейлер и внешние id сохраняются; стартовый статус "watched" создаёт
+// строку статуса создателя; у второго участника тот же сериал остаётся
+// "to-watch": статус персональный, а не общий.
+func TestSeriesExtendedFieldsAndPerUserStatus(t *testing.T) {
+	db := connectOrSkip(t)
+	ctx := context.Background()
+
+	owner := createTestUser(t, ctx, db)
+	other := createTestUser(t, ctx, db)
+	familyID := createTestFamily(t, ctx, db, owner)
+	addFamilyMember(t, ctx, db, familyID, other)
+	svc := series.NewService(db)
+
+	created, err := svc.Create(ctx, owner, familyID, series.CreateInput{
+		Title:          "Dune",
+		MediaType:      strPtr("movie"),
+		TrailerURL:     strPtr("https://example.com/trailer"),
+		ExternalSource: strPtr("tmdb"),
+		ExternalID:     strPtr("438631"),
+		Status:         strPtr("watched"),
+		Rating:         intPtr(4),
+		Comment:        strPtr("круто"),
+	})
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	if created.MediaType != "movie" || created.TrailerURL == nil || created.ExternalID == nil || *created.ExternalID != "438631" {
+		t.Errorf("extended fields lost: %+v", created)
+	}
+	if created.Status != "watched" || created.Rating == nil || *created.Rating != 4 || created.WatchedAt == nil {
+		t.Errorf("creator status = %+v, want watched/4 with watchedAt", created)
+	}
+	if created.CreatedAt.IsZero() {
+		t.Error("createdAt is empty")
+	}
+
+	list, err := svc.ListForFamily(ctx, other, familyID)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListForFamily(other) = %v, %v", list, err)
+	}
+	if list[0].Status != "to-watch" || list[0].Rating != nil {
+		t.Errorf("other member sees the creator's status: %+v", list[0])
+	}
+
+	// Рейтинг через PATCH пишется в статус вызывающего, не создателя.
+	updated, err := svc.Update(ctx, other, created.ID, series.UpdateInput{Rating: intPtr(2), Comment: strPtr("так себе")})
+	if err != nil {
+		t.Fatalf("Update() error: %v", err)
+	}
+	if updated.Rating == nil || *updated.Rating != 2 || updated.Status != "to-watch" {
+		t.Errorf("update by other = %+v", updated)
+	}
+	again, err := svc.Get(ctx, owner, created.ID)
+	if err != nil || again.Rating == nil || *again.Rating != 4 {
+		t.Errorf("owner's rating changed by someone else's PATCH: %+v, %v", again, err)
+	}
+
+	if _, err := svc.Create(ctx, owner, familyID, series.CreateInput{Title: "X", MediaType: strPtr("book")}); err == nil {
+		t.Error("an unknown mediaType was accepted")
+	}
+}
+
+// Комментарий отдаётся с именем автора и спойлер-пометкой; прогресс всех
+// участников -- одним списком с именами, и по сериалу, и по всей семье.
+func TestCommentAuthorSpoilerAndProgressLists(t *testing.T) {
+	db := connectOrSkip(t)
+	ctx := context.Background()
+
+	owner := createTestUser(t, ctx, db)
+	other := createTestUser(t, ctx, db)
+	familyID := createTestFamily(t, ctx, db, owner)
+	addFamilyMember(t, ctx, db, familyID, other)
+	svc := series.NewService(db)
+
+	created, err := svc.Create(ctx, owner, familyID, series.CreateInput{Title: "Severance"})
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+
+	comment, err := svc.AddComment(ctx, other, created.ID, series.CreateCommentInput{
+		Body: "ого", SpoilerSeason: intPtr(2), SpoilerEpisode: intPtr(5),
+	})
+	if err != nil {
+		t.Fatalf("AddComment() error: %v", err)
+	}
+	if comment.AuthorName == "" || comment.SpoilerSeason == nil || *comment.SpoilerSeason != 2 || *comment.SpoilerEpisode != 5 {
+		t.Errorf("comment = %+v, want author name and spoiler 2/5", comment)
+	}
+	if _, err := svc.AddComment(ctx, other, created.ID, series.CreateCommentInput{Body: "x", SpoilerEpisode: intPtr(3)}); err == nil {
+		t.Error("a spoiler episode without a season was accepted")
+	}
+
+	for _, user := range []string{owner, other} {
+		if _, err := svc.SetProgress(ctx, user, created.ID, series.SetProgressInput{CurrentSeason: 1, CurrentEpisode: 3}); err != nil {
+			t.Fatalf("SetProgress() error: %v", err)
+		}
+	}
+	bySeries, err := svc.ListSeriesProgress(ctx, owner, created.ID)
+	if err != nil || len(bySeries) != 2 || bySeries[0].DisplayName == "" || bySeries[0].UpdatedAt.IsZero() {
+		t.Errorf("ListSeriesProgress() = %+v, %v", bySeries, err)
+	}
+	byFamily, err := svc.ListFamilyProgress(ctx, owner, familyID)
+	if err != nil || len(byFamily) != 2 {
+		t.Errorf("ListFamilyProgress() = %+v, %v", byFamily, err)
+	}
+}

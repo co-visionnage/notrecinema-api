@@ -152,11 +152,11 @@ func TestTwoFactorSetupConfirmLoginDisable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate totp code: %v", err)
 	}
-	if err := svc.ConfirmTwoFactor(ctx, userID, code); err != nil {
+	if _, err := svc.ConfirmTwoFactor(ctx, userID, code); err != nil {
 		t.Fatalf("ConfirmTwoFactor() error: %v", err)
 	}
 
-	enabled, err := svc.TwoFactorStatus(ctx, userID)
+	enabled, _, err := svc.TwoFactorStatus(ctx, userID)
 	if err != nil {
 		t.Fatalf("TwoFactorStatus() error: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestTwoFactorSetupConfirmLoginDisable(t *testing.T) {
 		t.Fatalf("DisableTwoFactor() error: %v", err)
 	}
 
-	enabled, err = svc.TwoFactorStatus(ctx, userID)
+	enabled, _, err = svc.TwoFactorStatus(ctx, userID)
 	if err != nil {
 		t.Fatalf("TwoFactorStatus() error: %v", err)
 	}

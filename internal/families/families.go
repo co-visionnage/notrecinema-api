@@ -21,6 +21,7 @@ import (
 	"notrecinema/api/internal/auth"
 	"notrecinema/api/internal/outbox"
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/platform/ratelimit"
 	"notrecinema/api/internal/platform/response"
 	"notrecinema/api/internal/postgres"
 )
@@ -41,6 +42,9 @@ type Family struct {
 	Name       string `json:"name"`
 	InviteCode string `json:"inviteCode"`
 	OwnerID    string `json:"ownerId"`
+	// Role и JoinedAt -- членство вызывающего пользователя в этой семье.
+	Role     string    `json:"role"`
+	JoinedAt time.Time `json:"joinedAt"`
 }
 
 type Service struct {
@@ -56,7 +60,7 @@ func (s *Service) ListForUser(ctx context.Context, userID string) ([]Family, err
 
 	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT f.id, f.name, f.invite_code, f.owner_id
+			SELECT f.id, f.name, f.invite_code, f.owner_id, m.role, m.joined_at
 			FROM public.families f
 			JOIN public.family_members m ON m.family_id = f.id
 			WHERE m.user_id = $1
@@ -69,7 +73,7 @@ func (s *Service) ListForUser(ctx context.Context, userID string) ([]Family, err
 
 		for rows.Next() {
 			var f Family
-			if err := rows.Scan(&f.ID, &f.Name, &f.InviteCode, &f.OwnerID); err != nil {
+			if err := rows.Scan(&f.ID, &f.Name, &f.InviteCode, &f.OwnerID, &f.Role, &f.JoinedAt); err != nil {
 				return err
 			}
 			families = append(families, f)
@@ -108,6 +112,8 @@ func (s *Service) Create(ctx context.Context, userID, name string) (Family, erro
 			VALUES ($1, $2, $3)
 			RETURNING id, name, invite_code, owner_id
 		`, name, userID, inviteCode)
+		family.Role = "owner"
+		family.JoinedAt = time.Now()
 		if err := row.Scan(&family.ID, &family.Name, &family.InviteCode, &family.OwnerID); err != nil {
 			return err
 		}
@@ -145,15 +151,32 @@ func (s *Service) Create(ctx context.Context, userID, name string) (Family, erro
 // 0001_initial_schema.sql): не-участнику нужно найти семью по коду
 // раньше, чем обычный SELECT из families (который требует уже быть
 // участником) вообще что-то ему покажет.
+const (
+	joinRateLimitMaxAttempts   = 10
+	joinRateLimitWindowSeconds = 10 * 60
+)
+
 func (s *Service) Join(ctx context.Context, userID, inviteCode string) (Family, error) {
 	inviteCode = strings.TrimSpace(inviteCode)
 	if inviteCode == "" {
 		return Family{}, apperror.Invalid("inviteCode is required")
 	}
 
+	// Перебор шестизначного кода без ограничений был бы возможен; лимит
+	// по пользователю (как и в исходной реализации): 10 попыток за 10 минут.
+	allowed, err := ratelimit.Check(ctx, s.db, "join-family:user:"+userID, joinRateLimitMaxAttempts, joinRateLimitWindowSeconds)
+	if err != nil {
+		return Family{}, apperror.Internal("failed to check rate limit", err)
+	}
+	if !allowed {
+		return Family{}, apperror.RateLimited("Слишком много попыток. Попробуйте позже.")
+	}
+
 	var family Family
-	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
+	err = s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `SELECT family_id, name, invite_code FROM public.find_family_by_invite_code($1)`, inviteCode)
+		family.Role = "member"
+		family.JoinedAt = time.Now()
 		if err := row.Scan(&family.ID, &family.Name, &family.InviteCode); err != nil {
 			return err
 		}
@@ -174,6 +197,10 @@ func (s *Service) Join(ctx context.Context, userID, inviteCode string) (Family, 
 
 		displayName, err := lookupDisplayName(ctx, tx, userID)
 		if err != nil {
+			return err
+		}
+
+		if err := activitylog.Insert(ctx, tx, family.ID, userID, displayName, "member_joined", nil, nil); err != nil {
 			return err
 		}
 

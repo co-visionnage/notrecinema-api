@@ -54,6 +54,11 @@ type Config struct {
 	NudgeCheckInterval time.Duration `env:"NUDGE_CHECK_INTERVAL" env-default:"24h"`
 	NudgeDaysThreshold int           `env:"NUDGE_DAYS_THRESHOLD" env-default:"14"`
 
+	// UnsubscribeSecret -- HMAC-ключ ссылок отписки в письмах. Общий с
+	// notrecinema-worker: воркер подписывает ссылку при отправке, API
+	// проверяет. Без него отписка по ссылке не работает (запрос завершается ошибкой).
+	UnsubscribeSecret string `env:"UNSUBSCRIBE_SECRET"`
+
 	// Environment -- "production" включает Secure на cookie сессии/OAuth-state
 	// (тот же process.env.NODE_ENV === 'production' чек, что в notrecinema-app).
 	Environment string `env:"APP_ENV" env-default:"development"`
