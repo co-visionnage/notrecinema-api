@@ -21,6 +21,7 @@ import (
 	"notrecinema/api/internal/auth"
 	"notrecinema/api/internal/calendar"
 	"notrecinema/api/internal/config"
+	"notrecinema/api/internal/digest"
 	"notrecinema/api/internal/eventbus"
 	"notrecinema/api/internal/events"
 	"notrecinema/api/internal/export"
@@ -129,6 +130,14 @@ func run(logger *slog.Logger) error {
 
 	nudgeChecker := nudges.NewChecker(db, logger, cfg.NudgeCheckInterval, cfg.NudgeDaysThreshold)
 	go nudgeChecker.Run(ctx)
+
+	if cfg.DigestEnabled {
+		digestWeekday, err := digest.ParseWeekday(cfg.DigestWeekday)
+		if err != nil {
+			return err
+		}
+		go digest.NewRunner(db, logger, cfg.DigestCheckInterval, digestWeekday, cfg.DigestHourUTC).Run(ctx)
+	}
 
 	uploadService := upload.NewService(upload.Config{
 		Endpoint:  cfg.StorageEndpoint,

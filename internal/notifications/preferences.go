@@ -34,6 +34,9 @@ type Category struct {
 	EmailSupported bool
 	// EmailDefault -- включена ли почта по умолчанию.
 	EmailDefault bool
+	// NoPush -- по категории нет push-уведомлений (только письмо), поэтому
+	// в настройках канал push не предлагается.
+	NoPush bool
 }
 
 // Порядок -- порядок показа в настройках.
@@ -46,6 +49,7 @@ var Categories = []Category{
 	{Key: "poll"},
 	{Key: "watch_event"},
 	{Key: "member_joined"},
+	{Key: "weekly_digest", EmailSupported: true, EmailDefault: true, NoPush: true},
 }
 
 func categoryByKey(key string) (Category, bool) {
@@ -62,6 +66,7 @@ type Preference struct {
 	Push           bool   `json:"push"`
 	Email          bool   `json:"email"`
 	EmailSupported bool   `json:"emailSupported"`
+	PushSupported  bool   `json:"pushSupported"`
 }
 
 type PreferenceInput struct {
@@ -99,9 +104,12 @@ func (s *Service) GetPreferences(ctx context.Context, userID string) ([]Preferen
 
 	result := make([]Preference, 0, len(Categories))
 	for _, c := range Categories {
-		pref := Preference{Category: c.Key, Push: true, Email: c.EmailDefault, EmailSupported: c.EmailSupported}
+		pref := Preference{
+			Category: c.Key, Push: !c.NoPush, Email: c.EmailDefault,
+			EmailSupported: c.EmailSupported, PushSupported: !c.NoPush,
+		}
 		if saved, ok := stored[c.Key]; ok {
-			pref.Push = saved.Push
+			pref.Push = saved.Push && !c.NoPush
 			pref.Email = saved.Email
 		}
 		result = append(result, pref)

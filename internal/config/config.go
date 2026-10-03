@@ -5,6 +5,7 @@
 package config
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
@@ -54,6 +55,15 @@ type Config struct {
 	NudgeCheckInterval time.Duration `env:"NUDGE_CHECK_INTERVAL" env-default:"24h"`
 	NudgeDaysThreshold int           `env:"NUDGE_DAYS_THRESHOLD" env-default:"14"`
 
+	// Еженедельная сводка семьи (internal/digest): включена по умолчанию.
+	// Рассылка срабатывает один раз в неделю в DigestWeekday не раньше
+	// DigestHourUTC (по умолчанию понедельник 06:00 UTC -- 09:00 в Москве);
+	// проверка идёт каждые DigestCheckInterval.
+	DigestEnabled       bool          `env:"DIGEST_ENABLED" env-default:"true"`
+	DigestWeekday       string        `env:"DIGEST_WEEKDAY" env-default:"monday"`
+	DigestHourUTC       int           `env:"DIGEST_HOUR_UTC" env-default:"6"`
+	DigestCheckInterval time.Duration `env:"DIGEST_CHECK_INTERVAL" env-default:"30m"`
+
 	// UnsubscribeSecret -- HMAC-ключ ссылок отписки в письмах. Общий с
 	// notrecinema-worker: воркер подписывает ссылку при отправке, API
 	// проверяет. Без него отписка по ссылке не работает (запрос завершается ошибкой).
@@ -87,6 +97,9 @@ func Load() (Config, error) {
 	var cfg Config
 	if err := cleanenv.ReadEnv(&cfg); err != nil {
 		return Config{}, err
+	}
+	if cfg.DigestHourUTC < 0 || cfg.DigestHourUTC > 23 {
+		return Config{}, fmt.Errorf("config: DIGEST_HOUR_UTC должен быть от 0 до 23, получено %d", cfg.DigestHourUTC)
 	}
 	return cfg, nil
 }
