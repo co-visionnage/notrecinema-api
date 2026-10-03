@@ -152,6 +152,9 @@ services:
 
 networks:
   notrecinema-net:
+    # Фиксированное имя: к этой сети подключается стек мониторинга
+    # (notrecinema-infra, роль monitoring), чтобы забирать метрики api и воркера.
+    name: notrecinema-net
     driver: bridge
 
 volumes:
