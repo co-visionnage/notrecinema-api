@@ -6,6 +6,13 @@ API и воркер отдают Prometheus-метрики на `GET /metrics`: 
 `/metrics` у каждого сайта (`nginx_default_deny_paths`), Prometheus ходит к
 сервисам напрямую по внутренней сети.
 
+Сбор — VictoriaMetrics, дашборды — Grafana, правила алертов — vmalert; всё
+это разворачивает роль `monitoring` из `notrecinema-infra` (README там же).
+Заметьте: у метрик фоновых задач есть собственная метка `job` (`nudges`,
+`seasons_refresh`, `calendar_refresh`), а сборщик сам присваивает метрике
+`job` с именем scrape-задачи, поэтому в запросах метка задачи называется
+`exported_job`.
+
 Имена и метки ниже взяты из кода (`internal/telemetry`, `internal/outbox`,
 `notrecinema-worker/internal/telemetry`). Помимо перечисленного, процессы
 отдают стандартные `go_*` и `process_*`.
