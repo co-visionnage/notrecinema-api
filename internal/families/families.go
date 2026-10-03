@@ -157,7 +157,7 @@ const (
 )
 
 func (s *Service) Join(ctx context.Context, userID, inviteCode string) (Family, error) {
-	inviteCode = strings.TrimSpace(inviteCode)
+	inviteCode = strings.ToUpper(strings.TrimSpace(inviteCode))
 	if inviteCode == "" {
 		return Family{}, apperror.Invalid("inviteCode is required")
 	}
@@ -238,18 +238,25 @@ func lookupDisplayName(ctx context.Context, tx pgx.Tx, userID string) (string, e
 	return email, nil
 }
 
+// inviteCodePrefix и длина случайной части -- формат кода, который показывает
+// и принимает интерфейс (плейсхолдер BRTL-XXXXXX): так же его выдавал
+// монолит.
+const (
+	inviteCodePrefix = "BRTL-"
+	inviteCodeLength = 6
+)
+
 func generateInviteCode() (string, error) {
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // без неоднозначных O/0/I/1
-	const length = 8
 
-	buf := make([]byte, length)
+	buf := make([]byte, inviteCodeLength)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
 	for i, b := range buf {
 		buf[i] = alphabet[int(b)%len(alphabet)]
 	}
-	return string(buf), nil
+	return inviteCodePrefix + string(buf), nil
 }
 
 type Member struct {
