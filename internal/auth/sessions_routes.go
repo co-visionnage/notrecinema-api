@@ -38,7 +38,10 @@ func RegisterSessionRoutes(mux *http.ServeMux, svc *Service) {
 
 		out := make([]sessionResponse, 0, len(sessions))
 		for _, s := range sessions {
-			out = append(out, sessionResponse(s))
+			out = append(out, sessionResponse{
+				ID: s.ID, Current: s.Current, IP: s.IP, UserAgent: s.UserAgent,
+				CreatedAt: s.CreatedAt, LastSeenAt: s.LastSeenAt, ExpiresAt: s.ExpiresAt,
+			})
 		}
 		response.JSON(w, http.StatusOK, map[string]any{"sessions": out})
 	})
