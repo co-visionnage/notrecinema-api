@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -403,5 +405,37 @@ func TestJoinIsRateLimitedPerUser(t *testing.T) {
 	var appErr *apperror.Error
 	if !errors.As(err, &appErr) || appErr.Kind != apperror.KindRateLimited {
 		t.Errorf("the 11th attempt = %v, want a rate-limit error", err)
+	}
+}
+
+// Код приглашения имеет формат, который показывает интерфейс (BRTL-XXXXXX),
+// и принимается в любом регистре.
+func TestInviteCodeFormatAndCaseInsensitiveJoin(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL not set, skipping integration test")
+	}
+
+	ctx := context.Background()
+	db, err := postgres.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer db.Close()
+
+	svc := families.NewService(db)
+	owner := createTestUser(t, ctx, db)
+	joiner := createTestUser(t, ctx, db)
+
+	created, err := svc.Create(ctx, owner, "Format Family")
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	if !regexp.MustCompile(`^BRTL-[A-Z2-9]{6}$`).MatchString(created.InviteCode) {
+		t.Errorf("invite code = %q, want BRTL-XXXXXX", created.InviteCode)
+	}
+
+	if _, err := svc.Join(ctx, joiner, " "+strings.ToLower(created.InviteCode)+" "); err != nil {
+		t.Errorf("Join() with a lower-case, padded code error: %v", err)
 	}
 }
