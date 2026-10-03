@@ -8,8 +8,10 @@ import (
 	"sync"
 
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/platform/ratelimit"
 	"notrecinema/api/internal/platform/response"
 	"notrecinema/api/internal/postgres"
+	"notrecinema/api/internal/telemetry"
 )
 
 const (
@@ -28,7 +30,7 @@ type Service struct {
 func NewService(db *postgres.Pool, kinopoiskAPIKey, omdbAPIKey, traktClientID string) *Service {
 	return &Service{
 		db:              db,
-		httpClient:      http.DefaultClient,
+		httpClient:      telemetry.InstrumentedClient(),
 		kinopoiskAPIKey: kinopoiskAPIKey,
 		omdbAPIKey:      omdbAPIKey,
 		traktClientID:   traktClientID,
@@ -58,11 +60,7 @@ func (s *Service) Search(ctx context.Context, query string) ([]ImportedSeries, e
 }
 
 func (s *Service) checkRateLimit(ctx context.Context, bucketKey string) (bool, error) {
-	var allowed bool
-	err := s.db.QueryRow(ctx, `
-		SELECT public.check_rate_limit($1, $2, $3)
-	`, bucketKey, rateLimitMaxAttempts, rateLimitWindowSecond).Scan(&allowed)
-	return allowed, err
+	return ratelimit.Check(ctx, s.db, bucketKey, rateLimitMaxAttempts, rateLimitWindowSecond)
 }
 
 func clientIP(r *http.Request) string {
@@ -102,7 +100,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 			return
 		}
 		if svc.kinopoiskAPIKey == "" && svc.omdbAPIKey == "" {
-			response.Error(w, apperror.Invalid("импорт не настроен: нет KINOPOISK_API_KEY или OMDB_API_KEY"))
+			response.JSON(w, http.StatusNotImplemented, map[string]string{"error": "импорт не настроен: нет KINOPOISK_API_KEY или OMDB_API_KEY"})
 			return
 		}
 
@@ -131,7 +129,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 			return
 		}
 		if svc.traktClientID == "" {
-			response.Error(w, apperror.Invalid("импорт из Trakt не настроен: нет TRAKT_CLIENT_ID"))
+			response.JSON(w, http.StatusNotImplemented, map[string]string{"error": "импорт из Trakt не настроен: нет TRAKT_CLIENT_ID"})
 			return
 		}
 

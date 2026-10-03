@@ -8,6 +8,7 @@ import (
 
 	"notrecinema/api/internal/outbox"
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/telemetry"
 )
 
 // Подтверждение email и сброс пароля. Сами письма отправляет
@@ -28,8 +29,10 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) error {
 		return apperror.Internal("failed to verify email", err)
 	}
 	if !ok {
+		telemetry.RecordAuth("email_verify", "invalid_token")
 		return apperror.Invalid(errInvalidLink)
 	}
+	telemetry.RecordAuth("email_verify", "success")
 	return nil
 }
 
@@ -66,6 +69,7 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email string) error 
 	if err := s.db.Exec(ctx, `SELECT public.request_password_reset($1)`, email); err != nil {
 		return apperror.Internal("failed to request password reset", err)
 	}
+	telemetry.RecordAuth("password_reset_request", "queued")
 	return nil
 }
 
@@ -84,7 +88,9 @@ func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) 
 		return apperror.Internal("failed to reset password", err)
 	}
 	if userID == nil {
+		telemetry.RecordAuth("password_reset_confirm", "invalid_token")
 		return apperror.Invalid(errInvalidLink)
 	}
+	telemetry.RecordAuth("password_reset_confirm", "success")
 	return nil
 }

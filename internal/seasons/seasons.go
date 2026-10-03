@@ -19,8 +19,10 @@ import (
 	"notrecinema/api/internal/auth"
 	"notrecinema/api/internal/outbox"
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/platform/ratelimit"
 	"notrecinema/api/internal/platform/response"
 	"notrecinema/api/internal/postgres"
+	"notrecinema/api/internal/telemetry"
 )
 
 const (
@@ -54,7 +56,7 @@ type Service struct {
 }
 
 func NewService(db *postgres.Pool, kinopoiskAPIKey, omdbAPIKey string, logger *slog.Logger) *Service {
-	return &Service{db: db, httpClient: http.DefaultClient, kinopoiskAPIKey: kinopoiskAPIKey, omdbAPIKey: omdbAPIKey, logger: logger}
+	return &Service{db: db, httpClient: telemetry.InstrumentedClient(), kinopoiskAPIKey: kinopoiskAPIKey, omdbAPIKey: omdbAPIKey, logger: logger}
 }
 
 func (s *Service) Configured() bool {
@@ -80,10 +82,8 @@ func (s *Service) CheckSeriesUpdates(ctx context.Context, userID, seriesID strin
 		return CheckResult{}, err
 	}
 
-	var allowed bool
-	if err := s.db.QueryRow(ctx, `
-		SELECT public.check_rate_limit($1, $2, $3)
-	`, "season-check:user:"+userID, rateLimitMaxAttempts, rateLimitWindowSecond).Scan(&allowed); err != nil {
+	allowed, err := ratelimit.Check(ctx, s.db, "season-check:user:"+userID, rateLimitMaxAttempts, rateLimitWindowSecond)
+	if err != nil {
 		return CheckResult{}, apperror.Internal("failed to check rate limit", err)
 	}
 	if !allowed {
@@ -252,7 +252,10 @@ func (s *Service) RunPeriodicRefresh(ctx context.Context, interval time.Duration
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := s.RefreshAll(ctx); err != nil {
+			started := time.Now()
+			err := s.RefreshAll(ctx)
+			telemetry.RecordJob("seasons_refresh", started, err)
+			if err != nil {
 				s.logger.Error("seasons: ошибка массового обновления", "error", err)
 			}
 		}

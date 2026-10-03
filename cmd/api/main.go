@@ -54,6 +54,9 @@ func main() {
 	}
 }
 
+// version подставляется при сборке образа: -ldflags "-X main.version=<sha>".
+var version = "dev"
+
 func run(logger *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -76,12 +79,20 @@ func run(logger *slog.Logger) error {
 	}()
 
 	metrics := telemetry.NewMetrics(prometheus.DefaultRegisterer)
+	telemetry.SetBuildInfo("notrecinema-api", version)
 
 	db, err := postgres.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+
+	// Состояние пула соединений и сводные числа платформы (люди, семьи,
+	// сериалы, сессии) считаются в момент скрейпа.
+	prometheus.MustRegister(
+		telemetry.NewPoolCollector(db.Stat),
+		telemetry.NewPlatformStatsCollector(db, logger),
+	)
 
 	bus, err := eventbus.Connect(ctx, cfg.NatsURL)
 	if err != nil {
@@ -99,7 +110,7 @@ func run(logger *slog.Logger) error {
 	pollsService := polls.NewService(db)
 	eventsService := events.NewService(db)
 	activityService := activitylog.NewService(db)
-	notificationsService := notifications.NewService(db)
+	notificationsService := notifications.NewService(db).WithUnsubscribeSecret(cfg.UnsubscribeSecret)
 	statsService := stats.NewService(db)
 	historyService := history.NewService(db)
 	exportService := export.NewService(db)
@@ -162,8 +173,10 @@ func run(logger *slog.Logger) error {
 	protectedMux := http.NewServeMux()
 	auth.RegisterProtectedRoutes(protectedMux, authService)
 	auth.RegisterProtectedEmailRoutes(protectedMux, authService)
+	auth.RegisterSessionRoutes(protectedMux, authService)
 	users.RegisterRoutes(protectedMux, usersService, authService)
 	families.RegisterRoutes(protectedMux, familiesService)
+	families.RegisterInvitationRoutes(protectedMux, publicMux, familiesService)
 	series.RegisterRoutes(protectedMux, seriesService)
 	series.RegisterBulkRoutes(protectedMux, seriesService)
 	series.RegisterStatusRoutes(protectedMux, seriesService)
@@ -175,6 +188,7 @@ func run(logger *slog.Logger) error {
 	activitylog.RegisterRoutes(protectedMux, activityService)
 	movies.RegisterRoutes(protectedMux, db, movieProviders)
 	notifications.RegisterRoutes(protectedMux, notificationsService)
+	notifications.RegisterPreferenceRoutes(protectedMux, publicMux, notificationsService)
 	stats.RegisterRoutes(protectedMux, statsService)
 	history.RegisterRoutes(protectedMux, historyService)
 	export.RegisterRoutes(protectedMux, exportService)
@@ -183,15 +197,16 @@ func run(logger *slog.Logger) error {
 	upload.RegisterRoutes(protectedMux, uploadService, db)
 	imports.RegisterRoutes(protectedMux, importsService)
 
-	// metrics.HTTPMiddleware оборачивает protectedMux, а не всю цепочку
-	// снаружи: auth.Middleware делает r.WithContext (создаёт новый
-	// *http.Request), и net/http.ServeMux пишет r.Pattern в тот объект,
-	// который реально дошёл до его ServeHTTP -- внешний обработчик,
-	// держащий более ранний r, эту мутацию никогда не увидит. Обернуть
-	// нужно как можно ближе к месту, где ServeMux сам вызывается.
-	publicMux.Handle("/", authService.Middleware(metrics.HTTPMiddleware(protectedMux)))
+	// Шаблон маршрута для метрик берётся из r.Pattern, который ServeMux
+	// пишет в тот *http.Request, что реально до него дошёл: auth.Middleware
+	// делает r.WithContext и создаёт копию, поэтому внешний обработчик
+	// выбранного маршрута не увидел бы. Поэтому CaptureRoute оборачивает
+	// сами mux'ы (и защищённый, и публичный), а HTTPMiddleware стоит
+	// снаружи и считает все запросы, в том числе публичные и отклонённые.
+	publicMux.Handle("/", authService.Middleware(telemetry.CaptureRoute(protectedMux)))
 
-	handler := httpserver.Chain(publicMux,
+	handler := httpserver.Chain(telemetry.CaptureRoute(publicMux),
+		metrics.HTTPMiddleware,
 		httpserver.RequestID,
 		httpserver.AccessLog(logger),
 		httpserver.Recover(logger),

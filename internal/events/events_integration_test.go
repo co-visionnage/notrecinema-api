@@ -121,8 +121,14 @@ func TestEventCreateRSVPAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListForFamily() error: %v", err)
 	}
-	if len(list) != 1 || len(list[0].RSVPs) != 1 || list[0].RSVPs[0].Status != "going" {
-		t.Fatalf("ListForFamily() = %+v, want 1 событие с 1 RSVP=going", list)
+	// Создатель идёт автоматически, плюс отметка участника.
+	if len(list) != 1 || len(list[0].RSVPs) != 2 {
+		t.Fatalf("ListForFamily() = %+v, want 1 событие с 2 RSVP (создатель и участник)", list)
+	}
+	for _, rsvp := range list[0].RSVPs {
+		if rsvp.Status != "going" || rsvp.DisplayName == "" {
+			t.Errorf("RSVP = %+v, want going with a display name", rsvp)
+		}
 	}
 
 	// attendee не создатель и не владелец семьи -- удалить событие не может.

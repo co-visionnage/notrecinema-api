@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"image/png"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pquerna/otp"
@@ -13,6 +14,7 @@ import (
 
 	"notrecinema/api/internal/outbox"
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/telemetry"
 )
 
 // issuer — прямой перенос 'notre-cinema' из generateTotpQrCode.
@@ -91,59 +93,159 @@ func qrCodeDataURL(key *otp.Key) (string, error) {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
-// ConfirmTwoFactor — прямой перенос confirmTwoFactorAction.
-func (s *Service) ConfirmTwoFactor(ctx context.Context, userID, code string) error {
-	return s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
-		var secret *string
-		if err := tx.QueryRow(ctx, `
-			SELECT totp_secret FROM public.profiles WHERE id = $1
-		`, userID).Scan(&secret); err != nil {
+// loadTwoFactorState читает секрет и флаг 2FA пользователя.
+func (s *Service) loadTwoFactorState(ctx context.Context, userID string) (secret *string, enabled bool, err error) {
+	err = s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT totp_secret, totp_enabled FROM public.profiles WHERE id = $1
+		`, userID).Scan(&secret, &enabled)
+	})
+	return secret, enabled, err
+}
+
+func asAppError(err error, fallback string) error {
+	var appErr *apperror.Error
+	if errors.As(err, &appErr) {
+		return appErr
+	}
+	return apperror.Internal(fallback, err)
+}
+
+// ConfirmTwoFactor — перенос confirmTwoFactorAction: подтверждает настройку
+// кодом из приложения, включает 2FA и впервые выдаёт резервные коды. Коды
+// возвращаются открытым текстом ровно один раз -- дальше в БД только хэши.
+func (s *Service) ConfirmTwoFactor(ctx context.Context, userID, code string) ([]string, error) {
+	secret, enabled, err := s.loadTwoFactorState(ctx, userID)
+	if err != nil {
+		return nil, asAppError(err, "failed to load two-factor state")
+	}
+	if enabled {
+		return nil, apperror.Conflict("двухфакторная аутентификация уже включена")
+	}
+	if secret == nil {
+		return nil, apperror.Invalid("сначала начните настройку — отсканируйте QR-код")
+	}
+	if !isTOTPFormat(code) || !verifyTOTP(strings.TrimSpace(code), *secret) {
+		telemetry.RecordAuth("two_factor_enable", "invalid_code")
+		return nil, apperror.Invalid("неверный код")
+	}
+
+	codes, err := generateBackupCodes()
+	if err != nil {
+		return nil, apperror.Internal("failed to generate backup codes", err)
+	}
+	hashes, err := hashBackupCodes(codes)
+	if err != nil {
+		return nil, apperror.Internal("failed to hash backup codes", err)
+	}
+
+	err = s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE public.profiles SET totp_enabled = true WHERE id = $1`, userID); err != nil {
 			return err
 		}
-		if secret == nil {
-			return apperror.Invalid("сначала начните настройку — отсканируйте QR-код")
-		}
-		if !verifyTOTP(code, *secret) {
-			return apperror.Invalid("неверный код")
-		}
-
-		if _, err := tx.Exec(ctx, `UPDATE public.profiles SET totp_enabled = true WHERE id = $1`, userID); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT public.replace_two_factor_backup_codes($1::text[])`, hashes); err != nil {
 			return err
 		}
 		return outbox.Insert(ctx, tx, "profile", userID, "security.two_factor_enabled", map[string]string{"userId": userID})
 	})
+	if err != nil {
+		return nil, asAppError(err, "failed to enable two-factor authentication")
+	}
+	telemetry.RecordAuth("two_factor_enable", "success")
+	return codes, nil
 }
 
-// DisableTwoFactor — прямой перенос disableTwoFactorAction: требует
-// валидный текущий код, затем полностью стирает секрет (не только флаг).
+// DisableTwoFactor — перенос disableTwoFactorAction: требует валидный
+// текущий код (из приложения или резервный -- человек, потерявший телефон и
+// вошедший по резервному коду, должен суметь отключить 2FA), затем полностью
+// стирает секрет и резервные коды.
 func (s *Service) DisableTwoFactor(ctx context.Context, userID, code string) error {
-	return s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
-		var secret *string
-		if err := tx.QueryRow(ctx, `
-			SELECT totp_secret FROM public.profiles WHERE id = $1
-		`, userID).Scan(&secret); err != nil {
-			return err
-		}
-		if secret == nil || !verifyTOTP(code, *secret) {
-			return apperror.Invalid("неверный код")
-		}
+	secret, _, err := s.loadTwoFactorState(ctx, userID)
+	if err != nil {
+		return asAppError(err, "failed to load two-factor state")
+	}
 
+	ok, err := s.checkSecondFactor(ctx, userID, secret, code)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		telemetry.RecordAuth("two_factor_disable", "invalid_code")
+		return apperror.Invalid("неверный код")
+	}
+
+	err = s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
 			UPDATE public.profiles SET totp_enabled = false, totp_secret = NULL WHERE id = $1
 		`, userID); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, `SELECT public.delete_my_two_factor_backup_codes()`); err != nil {
+			return err
+		}
 		return outbox.Insert(ctx, tx, "profile", userID, "security.two_factor_disabled", map[string]string{"userId": userID})
 	})
+	if err != nil {
+		return asAppError(err, "failed to disable two-factor authentication")
+	}
+	telemetry.RecordAuth("two_factor_disable", "success")
+	return nil
 }
 
-// TwoFactorStatus — прямой перенос 2fa-status/route.ts.
-func (s *Service) TwoFactorStatus(ctx context.Context, userID string) (bool, error) {
-	var enabled bool
-	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT totp_enabled FROM public.profiles WHERE id = $1
-		`, userID).Scan(&enabled)
+// RegenerateBackupCodes выпускает новый набор резервных кодов; прежние, в
+// том числе неиспользованные, перестают работать. Нужен код подтверждения
+// (из приложения или резервный).
+func (s *Service) RegenerateBackupCodes(ctx context.Context, userID, code string) ([]string, error) {
+	secret, enabled, err := s.loadTwoFactorState(ctx, userID)
+	if err != nil {
+		return nil, asAppError(err, "failed to load two-factor state")
+	}
+	if !enabled {
+		return nil, apperror.Conflict("двухфакторная аутентификация не включена")
+	}
+
+	ok, err := s.checkSecondFactor(ctx, userID, secret, code)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		telemetry.RecordAuth("backup_codes_regenerate", "invalid_code")
+		return nil, apperror.Invalid("неверный код")
+	}
+
+	codes, err := generateBackupCodes()
+	if err != nil {
+		return nil, apperror.Internal("failed to generate backup codes", err)
+	}
+	hashes, err := hashBackupCodes(codes)
+	if err != nil {
+		return nil, apperror.Internal("failed to hash backup codes", err)
+	}
+
+	err = s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT public.replace_two_factor_backup_codes($1::text[])`, hashes); err != nil {
+			return err
+		}
+		return outbox.Insert(ctx, tx, "profile", userID, "security.backup_codes_regenerated", map[string]string{"userId": userID})
 	})
-	return enabled, err
+	if err != nil {
+		return nil, asAppError(err, "failed to store backup codes")
+	}
+	telemetry.RecordAuth("backup_codes_regenerate", "success")
+	return codes, nil
+}
+
+// TwoFactorStatus — перенос 2fa-status/route.ts, плюс сколько резервных
+// кодов осталось (чтобы интерфейс мог предупредить, что пора выпустить
+// новые).
+func (s *Service) TwoFactorStatus(ctx context.Context, userID string) (enabled bool, backupCodesRemaining int, err error) {
+	err = s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT totp_enabled FROM public.profiles WHERE id = $1
+		`, userID).Scan(&enabled); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT public.count_my_two_factor_backup_codes()`).Scan(&backupCodesRemaining)
+	})
+	return enabled, backupCodesRemaining, err
 }

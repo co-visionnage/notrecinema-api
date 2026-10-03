@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -19,6 +20,57 @@ type Progress struct {
 	UserID         string `json:"userId"`
 	CurrentSeason  int    `json:"currentSeason"`
 	CurrentEpisode int    `json:"currentEpisode"`
+}
+
+// ProgressEntry -- прогресс одного участника по одному сериалу вместе с
+// именем (для списков "кто на какой серии").
+type ProgressEntry struct {
+	SeriesID       string    `json:"seriesId"`
+	UserID         string    `json:"userId"`
+	DisplayName    string    `json:"displayName"`
+	CurrentSeason  int       `json:"currentSeason"`
+	CurrentEpisode int       `json:"currentEpisode"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+const progressEntrySelect = `
+	SELECT pr.series_id, pr.user_id, COALESCE(p.display_name, p.email), pr.current_season, pr.current_episode, pr.updated_at
+	FROM public.family_series_progress pr
+	JOIN public.profiles p ON p.id = pr.user_id`
+
+func (s *Service) queryProgressEntries(ctx context.Context, userID, where string, arg any) ([]ProgressEntry, error) {
+	list := []ProgressEntry{}
+	err := s.db.WithUserContext(ctx, userID, func(ctx context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, progressEntrySelect+where+` ORDER BY pr.updated_at DESC`, arg)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e ProgressEntry
+			if err := rows.Scan(&e.SeriesID, &e.UserID, &e.DisplayName, &e.CurrentSeason, &e.CurrentEpisode, &e.UpdatedAt); err != nil {
+				return err
+			}
+			list = append(list, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, apperror.Internal("failed to list progress", err)
+	}
+	return list, nil
+}
+
+// ListSeriesProgress -- прогресс всех участников по одному сериалу.
+func (s *Service) ListSeriesProgress(ctx context.Context, userID, seriesID string) ([]ProgressEntry, error) {
+	return s.queryProgressEntries(ctx, userID, ` WHERE pr.series_id = $1`, seriesID)
+}
+
+// ListFamilyProgress -- прогресс всех участников по всем сериалам семьи
+// одним запросом (главная страница иначе делала бы запрос на сериал).
+func (s *Service) ListFamilyProgress(ctx context.Context, userID, familyID string) ([]ProgressEntry, error) {
+	return s.queryProgressEntries(ctx, userID,
+		` JOIN public.family_series fs ON fs.id = pr.series_id WHERE fs.family_id = $1`, familyID)
 }
 
 type SetProgressInput struct {
@@ -90,6 +142,26 @@ func RegisterProgressRoutes(mux *http.ServeMux, svc *Service) {
 			return
 		}
 		response.JSON(w, http.StatusOK, result)
+	})
+
+	mux.HandleFunc("GET /api/v1/series/{seriesId}/progress/all", func(w http.ResponseWriter, r *http.Request) {
+		user := auth.UserFromContext(r.Context())
+		list, err := svc.ListSeriesProgress(r.Context(), user.ID, r.PathValue("seriesId"))
+		if err != nil {
+			response.Error(w, err)
+			return
+		}
+		response.JSON(w, http.StatusOK, list)
+	})
+
+	mux.HandleFunc("GET /api/v1/families/{familyId}/progress", func(w http.ResponseWriter, r *http.Request) {
+		user := auth.UserFromContext(r.Context())
+		list, err := svc.ListFamilyProgress(r.Context(), user.ID, r.PathValue("familyId"))
+		if err != nil {
+			response.Error(w, err)
+			return
+		}
+		response.JSON(w, http.StatusOK, list)
 	})
 
 	mux.HandleFunc("GET /api/v1/series/{seriesId}/progress", func(w http.ResponseWriter, r *http.Request) {

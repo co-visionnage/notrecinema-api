@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+
+	"notrecinema/api/internal/telemetry"
 )
 
 const omdbBaseURL = "https://www.omdbapi.com"
@@ -18,7 +20,7 @@ type OMDB struct {
 
 func NewOMDB(apiKey string, httpClient *http.Client) *OMDB {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = telemetry.InstrumentedClient()
 	}
 	return &OMDB{apiKey: apiKey, baseURL: omdbBaseURL, httpClient: httpClient}
 }

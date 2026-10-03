@@ -28,6 +28,11 @@ type Option struct {
 	ID       string `json:"id"`
 	SeriesID string `json:"seriesId"`
 	Votes    int    `json:"votes"`
+	// Title/ImageURL -- карточка сериала-варианта; VotedByMe -- голосовал
+	// ли за этот вариант вызывающий пользователь.
+	Title     string  `json:"title"`
+	ImageURL  *string `json:"imageUrl,omitempty"`
+	VotedByMe bool    `json:"votedByMe"`
 }
 
 type Poll struct {
@@ -139,12 +144,15 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 		}
 
 		optRows, err := tx.Query(ctx, `
-			SELECT o.id, o.poll_id, o.series_id, COUNT(v.id)
+			SELECT o.id, o.poll_id, o.series_id, COUNT(v.id), fs.title, fs.image_url,
+			       COALESCE(BOOL_OR(v.user_id = $2), false)
 			FROM public.family_watch_poll_options o
+			JOIN public.family_series fs ON fs.id = o.series_id
 			LEFT JOIN public.family_watch_poll_votes v ON v.option_id = o.id
 			WHERE o.poll_id = ANY($1)
-			GROUP BY o.id, o.poll_id, o.series_id
-		`, order)
+			GROUP BY o.id, o.poll_id, o.series_id, fs.title, fs.image_url
+			ORDER BY COUNT(v.id) DESC, fs.title
+		`, order, userID)
 		if err != nil {
 			return err
 		}
@@ -153,7 +161,7 @@ func (s *Service) ListForFamily(ctx context.Context, userID, familyID string) ([
 		for optRows.Next() {
 			var pollID string
 			var opt Option
-			if err := optRows.Scan(&opt.ID, &pollID, &opt.SeriesID, &opt.Votes); err != nil {
+			if err := optRows.Scan(&opt.ID, &pollID, &opt.SeriesID, &opt.Votes, &opt.Title, &opt.ImageURL, &opt.VotedByMe); err != nil {
 				return err
 			}
 			if p, ok := byID[pollID]; ok {

@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"notrecinema/api/internal/telemetry"
 )
 
 const service = "s3"
@@ -50,7 +52,7 @@ type Service struct {
 
 func NewService(cfg Config, httpClient *http.Client) *Service {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = telemetry.InstrumentedClient()
 	}
 	return &Service{cfg: cfg, httpClient: httpClient}
 }

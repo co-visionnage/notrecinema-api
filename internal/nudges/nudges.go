@@ -21,6 +21,7 @@ import (
 
 	"notrecinema/api/internal/outbox"
 	"notrecinema/api/internal/postgres"
+	"notrecinema/api/internal/telemetry"
 )
 
 type staleEntry struct {
@@ -61,7 +62,10 @@ func (c *Checker) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := c.CheckOnce(ctx); err != nil {
+			started := time.Now()
+			err := c.CheckOnce(ctx)
+			telemetry.RecordJob("nudges", started, err)
+			if err != nil {
 				c.logger.Error("nudges: ошибка проверки", "error", err)
 			}
 		}

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/telemetry"
 )
 
 // sessionTTL -- прямой перенос SESSION_TTL_DAYS (30) из notrecinema-app:
@@ -68,17 +69,22 @@ func (s *Service) Register(ctx context.Context, email, displayName, password str
 	if err := row.Scan(&user.ID, &user.Email, &dbDisplayName); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Message == "ACCOUNT_ALREADY_EXISTS" {
+			telemetry.RecordAuth("register", "duplicate")
 			return Session{}, apperror.Conflict("пользователь с таким email уже существует. Войдите в аккаунт")
 		}
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			telemetry.RecordAuth("register", "duplicate")
 			return Session{}, apperror.Conflict("пользователь с таким email уже существует")
 		}
+		telemetry.RecordAuth("register", "error")
 		return Session{}, apperror.Internal("failed to register account", err)
 	}
 	if dbDisplayName != nil {
 		user.DisplayName = *dbDisplayName
 	}
 
+	s.recordSessionMetadata(ctx, token)
+	telemetry.RecordAuth("register", "success")
 	return Session{Token: token, ExpiresAt: expiresAt, User: user}, nil
 }
 
@@ -101,12 +107,15 @@ func (s *Service) Login(ctx context.Context, email, password string) (LoginResul
 	`, email)
 	if err := row.Scan(&userID, &dbEmail, &dbDisplayName, &passwordHash, &totpEnabled); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			telemetry.RecordAuth("login", "invalid_credentials")
 			return LoginResult{}, apperror.Unauthorized("неверный email или пароль")
 		}
+		telemetry.RecordAuth("login", "error")
 		return LoginResult{}, apperror.Internal("failed to load account", err)
 	}
 
 	if passwordHash == nil || !VerifyPassword(password, *passwordHash) {
+		telemetry.RecordAuth("login", "invalid_credentials")
 		return LoginResult{}, apperror.Unauthorized("неверный email или пароль")
 	}
 
@@ -121,13 +130,16 @@ func (s *Service) Login(ctx context.Context, email, password string) (LoginResul
 		`, userID, hashToken(challengeToken), expiresAt); err != nil {
 			return LoginResult{}, apperror.Internal("failed to create two-factor challenge", err)
 		}
+		telemetry.RecordAuth("login", "two_factor_required")
 		return LoginResult{RequiresTwoFactor: true, ChallengeToken: challengeToken}, nil
 	}
 
 	session, err := s.createSessionForProfile(ctx, userID)
 	if err != nil {
+		telemetry.RecordAuth("login", "error")
 		return LoginResult{}, err
 	}
+	telemetry.RecordAuth("login", "success")
 	return LoginResult{Session: &session}, nil
 }
 
@@ -146,6 +158,7 @@ func (s *Service) VerifyTwoFactor(ctx context.Context, challengeToken, code stri
 		return Session{}, apperror.Internal("failed to load two-factor challenge", err)
 	}
 	if userID == nil {
+		telemetry.RecordAuth("two_factor_verify", "expired_challenge")
 		return Session{}, apperror.Invalid("сессия входа истекла. Войдите заново")
 	}
 
@@ -155,9 +168,20 @@ func (s *Service) VerifyTwoFactor(ctx context.Context, challengeToken, code stri
 	`, *userID).Scan(&secret); err != nil {
 		return Session{}, apperror.Internal("failed to load totp secret", err)
 	}
-	if secret == nil || !verifyTOTP(code, *secret) {
+	method := "backup_code"
+	if isTOTPFormat(code) {
+		method = "totp"
+	}
+	ok, err := s.checkSecondFactor(ctx, *userID, secret, code)
+	if err != nil {
+		telemetry.RecordAuth("two_factor_verify", method+"_error")
+		return Session{}, err
+	}
+	if !ok {
+		telemetry.RecordAuth("two_factor_verify", method+"_invalid")
 		return Session{}, apperror.Invalid("неверный код двухфакторной аутентификации")
 	}
+	telemetry.RecordAuth("two_factor_verify", method+"_success")
 
 	if err := s.db.Exec(ctx, `
 		SELECT public.delete_two_factor_challenge($1)
@@ -188,6 +212,7 @@ func (s *Service) createSessionForProfile(ctx context.Context, userID string) (S
 		user.DisplayName = *dbDisplayName
 	}
 
+	s.recordSessionMetadata(ctx, token)
 	return Session{Token: token, ExpiresAt: expiresAt, User: user}, nil
 }
 
@@ -218,6 +243,7 @@ func (s *Service) CreateSessionForEmail(ctx context.Context, email, displayName 
 		user.DisplayName = *dbDisplayName
 	}
 
+	s.recordSessionMetadata(ctx, token)
 	return Session{Token: token, ExpiresAt: expiresAt, User: user}, nil
 }
 

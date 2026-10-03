@@ -11,11 +11,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
+	"notrecinema/api/internal/activitylog"
 	"notrecinema/api/internal/families"
 	"notrecinema/api/internal/platform/apperror"
 	"notrecinema/api/internal/postgres"
@@ -148,6 +150,26 @@ func TestJoinAddsMemberAndFiresEvent(t *testing.T) {
 	}
 	if len(joinerFamilies) != 1 || joinerFamilies[0].ID != created.ID {
 		t.Errorf("ListForUser(joiner) = %+v, want exactly the joined family", joinerFamilies)
+	}
+	// Список несёт роль и дату вступления текущего пользователя.
+	if joinerFamilies[0].Role != "member" || joinerFamilies[0].JoinedAt.IsZero() {
+		t.Errorf("joiner membership = %+v, want role member with joinedAt", joinerFamilies[0])
+	}
+	ownerFamilies, err := svc.ListForUser(ctx, owner)
+	if err != nil || len(ownerFamilies) != 1 || ownerFamilies[0].Role != "owner" {
+		t.Errorf("ListForUser(owner) = %+v, %v, want role owner", ownerFamilies, err)
+	}
+	// Вступление попадает в журнал активности.
+	activity, err := activitylog.NewService(db).ListForFamily(ctx, owner, created.ID, 0)
+	if err != nil {
+		t.Fatalf("activity ListForFamily() error: %v", err)
+	}
+	var sawJoin bool
+	for _, entry := range activity.Entries {
+		sawJoin = sawJoin || entry.Action == "member_joined"
+	}
+	if !sawJoin {
+		t.Errorf("no member_joined entry in %+v", activity.Entries)
 	}
 
 	// Повторный join тем же пользователем -- конфликт (UNIQUE family_id+user_id).
@@ -349,5 +371,37 @@ func TestTransferOwnershipMovesRoles(t *testing.T) {
 	// Бывший владелец больше не может передавать владение -- он уже не owner.
 	if err := svc.TransferOwnership(ctx, owner, created.ID, member); err == nil {
 		t.Error("TransferOwnership() by former owner succeeded, want error")
+	}
+}
+
+// Перебор кода приглашения ограничен: после 10 попыток за окно -- отказ.
+func TestJoinIsRateLimitedPerUser(t *testing.T) {
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DATABASE_URL not set, skipping integration test")
+	}
+
+	ctx := context.Background()
+	db, err := postgres.Connect(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer db.Close()
+
+	svc := families.NewService(db)
+	guesser := createTestUser(t, ctx, db)
+
+	for attempt := 1; attempt <= 10; attempt++ {
+		_, err := svc.Join(ctx, guesser, "NOSUCHCODE")
+		var appErr *apperror.Error
+		if errors.As(err, &appErr) && appErr.Kind == apperror.KindRateLimited {
+			t.Fatalf("attempt %d was rate limited too early", attempt)
+		}
+	}
+
+	_, err = svc.Join(ctx, guesser, "NOSUCHCODE")
+	var appErr *apperror.Error
+	if !errors.As(err, &appErr) || appErr.Kind != apperror.KindRateLimited {
+		t.Errorf("the 11th attempt = %v, want a rate-limit error", err)
 	}
 }

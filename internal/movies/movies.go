@@ -18,6 +18,7 @@ import (
 	"notrecinema/api/internal/auth"
 	"notrecinema/api/internal/movieprovider"
 	"notrecinema/api/internal/platform/apperror"
+	"notrecinema/api/internal/platform/ratelimit"
 	"notrecinema/api/internal/platform/response"
 	"notrecinema/api/internal/postgres"
 )
@@ -47,10 +48,8 @@ func RegisterRoutes(mux *http.ServeMux, db *postgres.Pool, providers map[string]
 		}
 
 		user := auth.UserFromContext(r.Context())
-		var allowed bool
-		if err := db.QueryRow(r.Context(), `
-			SELECT public.check_rate_limit($1, $2, $3)
-		`, "movies:user:"+user.ID, rateLimitMaxAttempts, rateLimitWindowSecond).Scan(&allowed); err != nil {
+		allowed, err := ratelimit.Check(r.Context(), db, "movies:user:"+user.ID, rateLimitMaxAttempts, rateLimitWindowSecond)
+		if err != nil {
 			response.Error(w, apperror.Internal("failed to check rate limit", err))
 			return
 		}

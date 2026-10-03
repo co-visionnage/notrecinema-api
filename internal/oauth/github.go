@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"notrecinema/api/internal/auth"
+	"notrecinema/api/internal/telemetry"
 )
 
 const stateCookieName = "notre_cinema_github_oauth_state"
@@ -30,7 +31,7 @@ type Service struct {
 }
 
 func NewService(authSvc *auth.Service, clientID, clientSecret string) *Service {
-	return &Service{authSvc: authSvc, httpClient: http.DefaultClient, clientID: clientID, clientSecret: clientSecret}
+	return &Service{authSvc: authSvc, httpClient: telemetry.InstrumentedClient(), clientID: clientID, clientSecret: clientSecret}
 }
 
 func (s *Service) Configured() bool {
@@ -48,7 +49,13 @@ func requestOrigin(r *http.Request) string {
 	} else if r.TLS != nil {
 		scheme = "https"
 	}
-	return fmt.Sprintf("%s://%s", scheme, r.Host)
+	host := r.Host
+	// За прокси фронтенда (Next rewrites) Host запроса -- адрес API, а
+	// браузер ходил на домен фронтенда: callback должен вернуться туда.
+	if forwarded := r.Header.Get("X-Forwarded-Host"); forwarded != "" {
+		host = forwarded
+	}
+	return fmt.Sprintf("%s://%s", scheme, host)
 }
 
 func redirectWithError(w http.ResponseWriter, r *http.Request, target, message string) {
@@ -135,7 +142,12 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 			return
 		}
 
-		session, err := svc.completeLogin(r.Context(), code, origin)
+		session, err := svc.completeLogin(auth.WithRequest(r.Context(), r), code, origin)
+		if err != nil {
+			telemetry.RecordAuth("oauth_login", "failure")
+		} else {
+			telemetry.RecordAuth("oauth_login", "success")
+		}
 		if err != nil {
 			redirectWithError(w, r, redirectTarget, err.Error())
 			return

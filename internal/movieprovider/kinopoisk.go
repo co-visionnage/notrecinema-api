@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+
+	"notrecinema/api/internal/telemetry"
 )
 
 const kinopoiskBaseURL = "https://kinopoiskapiunofficial.tech/api/v2.2/films"
@@ -17,7 +19,7 @@ type Kinopoisk struct {
 
 func NewKinopoisk(apiKey string, httpClient *http.Client) *Kinopoisk {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = telemetry.InstrumentedClient()
 	}
 	return &Kinopoisk{apiKey: apiKey, baseURL: kinopoiskBaseURL, httpClient: httpClient}
 }

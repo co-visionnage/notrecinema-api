@@ -13,6 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"notrecinema/api/internal/telemetry"
 )
 
 type Pool struct {
@@ -33,6 +35,7 @@ func Connect(ctx context.Context, databaseURL string) (*Pool, error) {
 	poolConfig.MaxConns = 20
 	poolConfig.MaxConnIdleTime = 30 * time.Second
 	poolConfig.ConnConfig.ConnectTimeout = 5 * time.Second
+	poolConfig.ConnConfig.Tracer = telemetry.QueryTracer{}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
@@ -40,6 +43,11 @@ func Connect(ctx context.Context, databaseURL string) (*Pool, error) {
 	}
 
 	return &Pool{pool: pool}, nil
+}
+
+// Stat отдаёт состояние пула соединений (для метрик).
+func (p *Pool) Stat() *pgxpool.Stat {
+	return p.pool.Stat()
 }
 
 func (p *Pool) Close() {
@@ -90,8 +98,12 @@ func (p *Pool) WithUserContext(ctx context.Context, userID string, fn func(ctx c
 	if err != nil {
 		return fmt.Errorf("postgres: begin transaction: %w", err)
 	}
+
+	started := time.Now()
+	committed := false
 	defer func() {
 		_ = tx.Rollback(ctx)
+		telemetry.RecordTransaction(started, committed)
 	}()
 
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_user_id', $1, true)", userID); err != nil {
@@ -105,6 +117,7 @@ func (p *Pool) WithUserContext(ctx context.Context, userID string, fn func(ctx c
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("postgres: commit transaction: %w", err)
 	}
+	committed = true
 
 	return nil
 }
