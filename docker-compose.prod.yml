@@ -117,6 +117,12 @@ services:
         exec weed server -dir=/data -s3 -s3.config=/etc/seaweedfs/s3.json
     ports:
       - '127.0.0.1:8333:8333'
+      # Веб-интерфейсы: Filer (файлы бакета, 8888) и Master (состояние
+      # кластера, 9333). Авторизации у них нет, поэтому только loopback;
+      # открывать через SSH-туннель:
+      #   ssh -L 8888:127.0.0.1:8888 -L 9333:127.0.0.1:9333 deploy@<сервер>
+      - '127.0.0.1:8888:8888'
+      - '127.0.0.1:9333:9333'
     volumes:
       - notrecinema_seaweedfs_data:/data
     networks:
