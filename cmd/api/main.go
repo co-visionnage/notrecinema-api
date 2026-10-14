@@ -105,7 +105,7 @@ func run(logger *slog.Logger) error {
 	poller := outbox.NewPoller(db, bus, logger, metrics)
 	go poller.Run(ctx)
 
-	authService := auth.NewService(db, cfg.SessionCookieName, cfg.Environment)
+	authService := auth.NewService(db, cfg.SessionCookieName, cfg.Environment, auth.WithIPRateLimit(cfg.AuthIPRateLimit))
 	usersService := users.NewService(db)
 	familiesService := families.NewService(db)
 	seriesService := series.NewService(db)

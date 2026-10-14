@@ -36,12 +36,35 @@ type Service struct {
 	db          *postgres.Pool
 	cookieName  string
 	environment string
+	ipLimit     int
+}
+
+// DefaultIPRateLimit -- сколько попыток входа/регистрации и проверок 2FA
+// разрешено с одного IP за 15 минут.
+const DefaultIPRateLimit = 30
+
+// Option настраивает Service.
+type Option func(*Service)
+
+// WithIPRateLimit меняет лимит попыток с одного IP за 15 минут (по умолчанию
+// DefaultIPRateLimit). Нужен E2E-прогонам: они входят десятки раз с одного
+// адреса. Лимиты по email и по токену 2FA не меняются.
+func WithIPRateLimit(attempts int) Option {
+	return func(s *Service) {
+		if attempts > 0 {
+			s.ipLimit = attempts
+		}
+	}
 }
 
 // environment "production" включает Secure на cookie -- тот же чек
 // process.env.NODE_ENV === 'production', что и в notrecinema-app.
-func NewService(db *postgres.Pool, cookieName, environment string) *Service {
-	return &Service{db: db, cookieName: cookieName, environment: environment}
+func NewService(db *postgres.Pool, cookieName, environment string, options ...Option) *Service {
+	s := &Service{db: db, cookieName: cookieName, environment: environment, ipLimit: DefaultIPRateLimit}
+	for _, option := range options {
+		option(s)
+	}
+	return s
 }
 
 func (s *Service) isProduction() bool {

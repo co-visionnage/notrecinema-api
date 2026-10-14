@@ -71,6 +71,11 @@ type Config struct {
 	EventReminderLead     time.Duration `env:"EVENT_REMINDER_LEAD" env-default:"1h"`
 	EventReminderInterval time.Duration `env:"EVENT_REMINDER_INTERVAL" env-default:"1m"`
 
+	// AuthIPRateLimit -- сколько попыток входа, регистрации и проверок 2FA
+	// разрешено с одного IP за 15 минут. Менять стоит только в E2E-прогонах:
+	// десятки входов с одного адреса упираются в стандартные 30.
+	AuthIPRateLimit int `env:"AUTH_IP_RATE_LIMIT" env-default:"30"`
+
 	// UnsubscribeSecret -- HMAC-ключ ссылок отписки в письмах. Общий с
 	// notrecinema-worker: воркер подписывает ссылку при отправке, API
 	// проверяет. Без него отписка по ссылке не работает (запрос завершается ошибкой).

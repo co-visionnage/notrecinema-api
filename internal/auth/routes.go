@@ -24,12 +24,10 @@ var (
 )
 
 const (
-	ipRateLimitMaxAttempts    = 30
 	ipRateLimitWindowSeconds  = 15 * 60
 	emailRateLimitMaxAttempts = 5
 	emailRateLimitWindowSecs  = 15 * 60
 
-	twoFAIPMaxAttempts      = 30
 	twoFAIPWindowSeconds    = 15 * 60
 	twoFATokenMaxAttempts   = 5
 	twoFATokenWindowSeconds = 15 * 60
@@ -84,7 +82,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 		}
 		email := strings.ToLower(strings.TrimSpace(req.Email))
 
-		allowed, err := svc.checkRateLimit(r.Context(), "auth:ip:"+clientIP(r), ipRateLimitMaxAttempts, ipRateLimitWindowSeconds)
+		allowed, err := svc.checkRateLimit(r.Context(), "auth:ip:"+clientIP(r), svc.ipLimit, ipRateLimitWindowSeconds)
 		if err != nil {
 			writeAuthError(w, http.StatusInternalServerError, "internal server error")
 			return
@@ -187,7 +185,7 @@ func RegisterRoutes(mux *http.ServeMux, svc *Service) {
 			return
 		}
 
-		allowed, err := svc.checkRateLimit(r.Context(), "2fa:ip:"+clientIP(r), twoFAIPMaxAttempts, twoFAIPWindowSeconds)
+		allowed, err := svc.checkRateLimit(r.Context(), "2fa:ip:"+clientIP(r), svc.ipLimit, twoFAIPWindowSeconds)
 		if err != nil {
 			writeAuthError(w, http.StatusInternalServerError, "internal server error")
 			return
