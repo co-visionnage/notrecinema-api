@@ -64,6 +64,13 @@ type Config struct {
 	DigestHourUTC       int           `env:"DIGEST_HOUR_UTC" env-default:"6"`
 	DigestCheckInterval time.Duration `env:"DIGEST_CHECK_INTERVAL" env-default:"30m"`
 
+	// Напоминание о встрече (internal/eventreminders): за EventReminderLead
+	// до начала push и письмо всем участникам, кроме ответивших «нет».
+	// Проверка идёт каждые EventReminderInterval.
+	EventRemindersEnabled bool          `env:"EVENT_REMINDERS_ENABLED" env-default:"true"`
+	EventReminderLead     time.Duration `env:"EVENT_REMINDER_LEAD" env-default:"1h"`
+	EventReminderInterval time.Duration `env:"EVENT_REMINDER_INTERVAL" env-default:"1m"`
+
 	// UnsubscribeSecret -- HMAC-ключ ссылок отписки в письмах. Общий с
 	// notrecinema-worker: воркер подписывает ссылку при отправке, API
 	// проверяет. Без него отписка по ссылке не работает (запрос завершается ошибкой).
@@ -100,6 +107,9 @@ func Load() (Config, error) {
 	}
 	if cfg.DigestHourUTC < 0 || cfg.DigestHourUTC > 23 {
 		return Config{}, fmt.Errorf("config: DIGEST_HOUR_UTC должен быть от 0 до 23, получено %d", cfg.DigestHourUTC)
+	}
+	if cfg.EventReminderLead <= 0 || cfg.EventReminderInterval <= 0 {
+		return Config{}, fmt.Errorf("config: EVENT_REMINDER_LEAD и EVENT_REMINDER_INTERVAL должны быть положительными")
 	}
 	return cfg, nil
 }

@@ -48,6 +48,7 @@ var Categories = []Category{
 	{Key: "series_rated"},
 	{Key: "poll"},
 	{Key: "watch_event"},
+	{Key: "event_reminder", EmailSupported: true, EmailDefault: true},
 	{Key: "member_joined"},
 	{Key: "weekly_digest", EmailSupported: true, EmailDefault: true, NoPush: true},
 }
