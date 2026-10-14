@@ -23,6 +23,7 @@ import (
 	"notrecinema/api/internal/config"
 	"notrecinema/api/internal/digest"
 	"notrecinema/api/internal/eventbus"
+	"notrecinema/api/internal/eventreminders"
 	"notrecinema/api/internal/events"
 	"notrecinema/api/internal/export"
 	"notrecinema/api/internal/families"
@@ -137,6 +138,10 @@ func run(logger *slog.Logger) error {
 			return err
 		}
 		go digest.NewRunner(db, logger, cfg.DigestCheckInterval, digestWeekday, cfg.DigestHourUTC).Run(ctx)
+	}
+
+	if cfg.EventRemindersEnabled {
+		go eventreminders.NewRunner(db, logger, cfg.EventReminderInterval, cfg.EventReminderLead).Run(ctx)
 	}
 
 	uploadService := upload.NewService(upload.Config{

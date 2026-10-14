@@ -77,7 +77,7 @@ func TestCategoriesAreConsistent(t *testing.T) {
 			t.Errorf("%s: email is on by default but not supported", c.Key)
 		}
 	}
-	if len(Categories) != 9 {
-		t.Errorf("categories = %d, want 9 (the CHECK constraint in migration 0040 lists the same set)", len(Categories))
+	if len(Categories) != 10 {
+		t.Errorf("categories = %d, want 10 (the CHECK constraint in migration 0041 lists the same set)", len(Categories))
 	}
 }
